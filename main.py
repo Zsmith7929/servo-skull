@@ -17,7 +17,7 @@ BITRATE     = 8_000_000      # ~8 Mbps
 EXTRA_RPICAM_OPTS = [
     # "--shutter", "4000",       # ~1/250s; lower number = faster shutter (needs more light)
     # "--gain", "4.0",           # allow more sensor gain in darker scenes
-    "--autofocus"
+    "--autofocus-mode", "auto"
 ]
 
 OUTDIR = Path.home() / "dice_captures"
