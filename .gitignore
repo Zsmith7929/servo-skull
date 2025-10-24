@@ -1,0 +1,24 @@
+# Ignore Python cache and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Ignore virtual environments
+.venv/
+venv/
+
+# Ignore environment files and OS cruft
+.env
+*.log
+.DS_Store
+
+# Ignore temporary editor/project files
+*.swp
+*.swo
+.vscode/
+.idea/
