@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-import os, re, argparse
+import os, re, argparse, base64
 from pathlib import Path
-
 from google import genai
-from google.genai.types import Content, Part  # <- keep only these
 
 MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-INSTRUCTION = """You are a precise die-reading assistant.
-Look at the image of a single polyhedral die inside a dice tower.
-Decide which face is the TOP face (the one facing upward, the result of the roll).
-Return ONLY the Arabic numeral printed on the TOP face as an integer (no words, no extra text).
-If the top is ambiguous or fully occluded, return ONLY the string 'unknown'.
-"""
+INSTRUCTION = (
+    "You are a precise die-reading assistant.\n"
+    "Look at the image of a single polyhedral die inside a dice tower.\n"
+    "Decide which face is the TOP face (the one facing upward, the result of the roll).\n"
+    "Return ONLY the Arabic numeral printed on the TOP face as an integer (no words, no extra text).\n"
+    "If the top is ambiguous or fully occluded, return ONLY the string 'unknown'."
+)
 
 def parse_int(s: str, max_face: int):
     s = s.strip()
@@ -23,7 +22,6 @@ def parse_int(s: str, max_face: int):
     if not m:
         return None
     n = int(m.group(1))
-    # Allow typical dice outputs; permit 100 for percentile
     if (1 <= n <= max_face) or (max_face == 100 and 1 <= n <= 100):
         return n
     return None
@@ -34,27 +32,31 @@ def read_die(image_path: str, max_face: int = 20, retries: int = 1, verbose=Fals
 
     client = genai.Client(api_key=API_KEY)
     img_bytes = Path(image_path).read_bytes()
+    b64 = base64.b64encode(img_bytes).decode("ascii")
 
-    # Compose content: instruction + image + short nudge
-    contents = [
-        Content(role="user", parts=[
-            Part.from_text(INSTRUCTION),
-            Part.from_image(bytes=img_bytes, mime_type="image/jpeg"),
-            Part.from_text(f"Die type: d{max_face}. Return only the top face number.")
-        ])
-    ]
+    # Build contents with plain dicts (SDK-version-proof)
+    contents = [{
+        "role": "user",
+        "parts": [
+            {"text": INSTRUCTION},
+            {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+            {"text": f"Die type: d{max_face}. Return only the top face number."}
+        ],
+    }]
 
     last_text = ""
     for attempt in range(retries + 1):
         if verbose:
             print(f"[gemini] request attempt {attempt+1} …", flush=True)
+
+        # Keep it simple for compatibility; most versions accept 'contents' directly.
         resp = client.responses.generate(
             model=MODEL_NAME,
             contents=contents,
-            # Most builds accept generation settings in 'config', but we can omit for maximum compatibility:
-            # config={"temperature": 0.2, "max_output_tokens": 8}
+            # If your installed version supports generation_config, you can uncomment:
+            # generation_config={"temperature": 0.2, "max_output_tokens": 8},
         )
-        text = (resp.output_text or "").strip()
+        text = (getattr(resp, "output_text", None) or "").strip()
         last_text = text
         if verbose:
             print(f"[gemini] raw: {text}")
@@ -63,11 +65,12 @@ def read_die(image_path: str, max_face: int = 20, retries: int = 1, verbose=Fals
         if n is not None:
             return n, text
 
-        # If it talked too much, add a stricter follow-up and retry once
+        # Tighten the instruction and retry once if it talked too much
         if attempt < retries:
-            contents.append(Content(role="user", parts=[Part.from_text(
-                "Only the integer on the TOP face. If unclear, return 'unknown'. Do not add any extra words."
-            )]))
+            contents.append({
+                "role": "user",
+                "parts": [{"text": "Only the integer on the TOP face. If unclear, return 'unknown'. No extra words."}]
+            })
 
     raise RuntimeError(f"Gemini did not return a valid number. Last response: {last_text!r}")
 
