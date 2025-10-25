@@ -3,6 +3,7 @@ import os, sys, subprocess, time, signal, argparse
 from datetime import datetime
 from pathlib import Path
 import re
+import json
 
 import requests
 
@@ -21,20 +22,19 @@ GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 INSTRUCTION = (
     "You are a die-reading assistant.\n"
-    "Look at the image and identify the value on the TOP face of every visible die.\n"
+    "Identify the value on the TOP face of every visible die in the image.\n"
     "\n"
     "Rules:\n"
-    "1) For most dice, the correct face is the one facing UP (most horizontal), not the one pointing toward the camera.\n"
-    "2) The top face looks least angled and most parallel to the ground.\n"
-    "3) Ignore faces that look front-facing or vertical.\n"
-    "4) Digits may be rotated; orientation doesn’t matter.\n"
-    "5) For d4 dice (pyramid shape), report the number printed at the TOP TIP, not on the base.\n"
-    "6) If multiple dice are present, read each die separately and sum them.\n"
-    "7) Output as an equation: '5+4+6=15'.\n"
-    "8) If any die is unreadable, use 'unknown' and show partial sum, e.g. '3+unknown+5=8+'.\n"
-    "9) If nothing is readable, return exactly: unknown.\n"
+    "1) For most dice (d6–d20, d10, d12, d20…), the correct face is the one facing UP (most horizontal), not the face pointing toward the camera.\n"
+    "2) The top face appears least foreshortened and most parallel to the ground. Ignore front-facing side faces.\n"
+    "3) Digits may be rotated; orientation does not matter.\n"
+    "4) For d4 (pyramid), report the number printed at the top TIP (upward-pointing vertex), not the base.\n"
+    "5) If multiple dice are present, read each separately (order left→right).\n"
     "\n"
-    "Return only the result—no extra words or punctuation."
+    "OUTPUT FORMAT (mandatory):\n"
+    "Return ONLY a JSON array with one element per die. Each element must be either an integer (the top value) or the string \"unknown\".\n"
+    "No prose, no code fences, no keys, no math.\n"
+    "Examples: [12,4]   or   [3,\"unknown\",5]\n"
 )
 # ============================================
 
@@ -151,6 +151,79 @@ def parse_roll_expression(text: str, max_face: int):
 
     return display, values, total, unknowns
 
+def parse_values_json(text, max_face):
+    """
+    Parse a JSON array like: [12,4] or [3,"unknown",5].
+    Returns (values, unknown_count). 'values' is a list where ints are kept,
+    and unknown entries are represented by None.
+    """
+    s = (text or "").strip()
+
+    # Fast path: try strict JSON
+    try:
+        arr = json.loads(s)
+        if not isinstance(arr, list):
+            raise ValueError("not a list")
+        values, unknowns = [], 0
+        for el in arr:
+            if isinstance(el, int):
+                if (1 <= el <= max_face) or (max_face == 100 and 1 <= el <= 100):
+                    values.append(el)
+                else:
+                    # out-of-range integer; treat as unknown
+                    values.append(None); unknowns += 1
+            elif isinstance(el, str) and el.strip().lower() == "unknown":
+                values.append(None); unknowns += 1
+            else:
+                # unexpected type; treat as unknown
+                values.append(None); unknowns += 1
+        return values, unknowns
+    except Exception:
+        # Fallback: be forgiving if model forgot JSON; extract tokens
+        tokens = re.findall(r'unknown|\d{1,3}', s.lower())
+        values, unknowns = [], 0
+        for t in tokens:
+            if t == "unknown":
+                values.append(None); unknowns += 1
+            else:
+                n = int(t)
+                if (1 <= n <= max_face) or (max_face == 100 and 1 <= n <= 100):
+                    values.append(n)
+                else:
+                    values.append(None); unknowns += 1
+        if values:
+            return values, unknowns
+        # nothing usable
+        return [], 0
+
+def format_roll_expression(values):
+    """
+    values: list like [12, None, 4]
+    Returns display string and total of known ints.
+    - 1 die known: "12"
+    - multiple: "12+unknown+4=16+" (if any unknowns) or "12+4=16"
+    - none known: "unknown"
+    """
+    if not values:
+        return "unknown", 0
+    known = [v for v in values if isinstance(v, int)]
+    unk = sum(1 for v in values if v is None)
+
+    if not known and unk > 0:
+        return "unknown", 0
+
+    parts = [str(v) if isinstance(v, int) else "unknown" for v in values]
+    lhs = "+".join(parts)
+    total = sum(known)
+
+    if len(values) == 1 and unk == 0:
+        return str(known[0]), total
+
+    if unk > 0:
+        return f"{lhs}={total}+", total
+    else:
+        return f"{lhs}={total}", total
+
 def read_with_gemini(image_path, max_face=20, verbose=False):
     if not GEMINI_API_KEY:
         raise RuntimeError("Set GEMINI_API_KEY or GOOGLE_API_KEY in your shell (e.g., ~/.bashrc)")
@@ -164,33 +237,36 @@ def read_with_gemini(image_path, max_face=20, verbose=False):
     contents = [
         types.Part.from_text(text=INSTRUCTION),
         file_ref,
-        types.Part.from_text(text=f"Die type: d{max_face}. If multiple dice are present, output 'a+b+...=sum'. Use 'unknown' for unreadable dice."),
+        types.Part.from_text(
+            text=(
+                f"Die type: d{max_face}. Output must be ONLY a JSON array of values, "
+                f"left→right, each either an integer 1..{max_face}"
+                + ("" if max_face != 100 else " (or 1..100)") +
+                ' or the string "unknown". No math. No extra text.'
+            )
+        ),
     ]
     resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
-
     text = (getattr(resp, "text", None) or getattr(resp, "output_text", "") or "").strip()
     if verbose:
         print(f"[model] {text}")
 
-    display, values, total, unknowns = parse_roll_expression(text, max_face)
-    if display == "unknown":
-        # surface the raw for debugging if needed
-        if verbose:
-            print(f"[parse] unknown (raw: {text!r})")
-        return display, text  # 'unknown', raw text
+    values, unknowns = parse_values_json(text, max_face)
+    if not values:
+        raise RuntimeError(f"Model did not return any usable values. Raw: {text!r}")
 
-    return display, text  # e.g., '5+4+6=15'
+    return values, text  # list like [12, None, 4], and raw text for debugging
 
 # ---------- Discord ----------
-def post_image_to_discord(webhook_url, image_path, roll, verbose=False):
+def post_image_to_discord(webhook_url, image_path, display, verbose=False):
     if not webhook_url:
         vprint(verbose, "No DISCORD_WEBHOOK_URL set; skipping Discord post.")
         return False
 
-    if str(roll).lower() == "unknown":
+    if str(display).lower() == "unknown":
         content = "🤔 Gemini couldn't quite tell — maybe it’s cocked?"
     else:
-        content = f"🎲 Gemini thinks this roll is **{roll}**"
+        content = f"🎲 Gemini thinks this roll is **{display}**"
 
     files = []
     try:
@@ -238,17 +314,17 @@ def main():
     print(f"Classifying exactly: {jpg_path}", flush=True)
 
     try:
-        roll, raw = read_with_gemini(jpg_path, max_face=args.max_face, verbose=verbose)
-        print(f"Detected roll: {roll}", flush=True)
+        values, raw = read_with_gemini(jpg_path, max_face=args.max_face, verbose=verbose)
+        display, total = format_roll_expression(values)
+        print(f"Detected: {display}", flush=True)
     except Exception as e:
         print(f"Gemini error: {e}", file=sys.stderr, flush=True)
-        roll = "unknown"
+        display = "unknown"
 
+    ok = True
     if not args.no_discord:
-        ok = post_image_to_discord(DISCORD_WEBHOOK_URL, jpg_path, roll, verbose=verbose)
+        ok = post_image_to_discord(DISCORD_WEBHOOK_URL, jpg_path, display, verbose=verbose)
         print("Posted to Discord." if ok else "Failed to post to Discord.", flush=True)
-
-    print("Image:", jpg_path, flush=True)
 
 if __name__ == "__main__":
     import shutil as _shutil
