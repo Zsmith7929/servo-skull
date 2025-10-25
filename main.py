@@ -20,10 +20,14 @@ GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 INSTRUCTION = (
     "You are a precise die-reading assistant.\n"
-    "Look at the image of a single polyhedral die.\n"
-    "Decide which face is the TOP face (the result of the roll).\n"
-    "Return ONLY the Arabic numeral on the TOP face as an integer.\n"
-    "If unclear, return exactly: unknown"
+    "Task: identify the TOP face of a single polyhedral die and return ONLY the integer printed on that top face.\n"
+    "\n"
+    "Critical rules:\n"
+    "1) The correct result is the face that is UP (most horizontal), not the face pointing toward the camera.\n"
+    "2) If multiple faces are visible, choose the one whose surface is most parallel to the ground: it appears least foreshortened and most symmetric.\n"
+    "3) Ignore faces that look front-facing toward the camera if they are not the horizontal top face.\n"
+    "4) The top digit can be rotated in any direction; rotation does not matter.\n"
+    "5) Return ONLY the Arabic numeral of the TOP face as plain digits. If uncertain, return exactly: unknown\n"
 )
 # ============================================
 
@@ -109,7 +113,9 @@ def read_with_gemini(image_path, max_face=20, verbose=False):
     contents = [
         types.Part.from_text(text=INSTRUCTION),
         file_ref,
-        types.Part.from_text(text=f"Die type: d{max_face}. Return only the top face integer."),
+        types.Part.from_text(
+        text=f"Die type d{max_face}. If a side face looks clearer but is not horizontal, IGNORE it and output the top (horizontal) face only."
+    ),
     ]
     resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
     text = (getattr(resp, "text", None) or getattr(resp, "output_text", "") or "").strip()
