@@ -7,6 +7,13 @@ import cv2
 import numpy as np
 import requests
 
+# OCR (required for this numbers-only build)
+try:
+    import pytesseract
+    HAVE_TESS = True
+except Exception:
+    HAVE_TESS = False
+
 # ================== DEFAULT CONFIG ==================
 DURATION_MS = 7000           # 7 seconds
 FPS         = 30
@@ -17,7 +24,7 @@ BITRATE     = 8_000_000      # ~8 Mbps
 RPICAM_AF_OPTS = [
     "--autofocus-mode", "auto",
     "--autofocus-range", "macro",
-    # "--autofocus-speed", "fast",  # uncomment if you want more AF aggression
+    # "--autofocus-speed", "fast",
 ]
 
 OUTDIR = Path.home() / "dice_captures"
@@ -26,6 +33,7 @@ OUTDIR.mkdir(parents=True, exist_ok=True)
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 # =====================================================
 
+# ----------------- Utility helpers -------------------
 def nowtag():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -37,40 +45,44 @@ def run(cmd, verbose=False, timeout=None):
     vprint(verbose, f"→ RUN: {' '.join(cmd)} (timeout={timeout})")
     try:
         res = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout
         )
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         raise RuntimeError(f"Command timed out: {' '.join(cmd)}")
     if verbose:
-        if res.stdout.strip():
-            print("  STDOUT:", res.stdout.strip(), flush=True)
-        if res.stderr.strip():
-            print("  STDERR:", res.stderr.strip(), flush=True)
+        if res.stdout.strip(): print("  STDOUT:", res.stdout.strip(), flush=True)
+        if res.stderr.strip(): print("  STDERR:", res.stderr.strip(), flush=True)
     return res
 
-def record_video(ts, verbose=False, prefer_libav=True):
+def ms(): return int(time.time() * 1000)
+def elapsed_ms(t0): return ms() - t0
+def within_budget(t0, budget_ms): return elapsed_ms(t0) < budget_ms
+
+def save_debug(image, path, verbose=False):
+    try:
+        cv2.imwrite(str(path), image)
+        vprint(verbose, f"Saved debug: {path}")
+    except Exception as e:
+        vprint(verbose, f"Failed to save debug {path}: {e}")
+
+# --------------- Recording / muxing ------------------
+def record_video(ts, verbose=False, prefer_libav=True, fps=FPS, w=RES_W, h=RES_H, duration_ms=DURATION_MS):
     """
-    Record DURATION_MS and return path to finalized MP4.
+    Record duration_ms and return path to finalized MP4.
     Falls back to raw .h264 + ffmpeg mux if libav isn't available.
     """
     mp4_path  = OUTDIR / f"dice_{ts}.mp4"
     h264_path = OUTDIR / f"dice_{ts}.h264"
 
-    # We’ll allow a little extra time over DURATION_MS
-    # (recording cmd should never hang indefinitely).
-    record_timeout = max(10, int(DURATION_MS/1000) + 8)
+    record_timeout = max(10, int(duration_ms/1000) + 8)
 
     if prefer_libav:
         vprint(verbose, "Trying direct MP4 with libav muxer…")
         cmd = [
             "rpicam-vid",
-            "-t", str(DURATION_MS),
-            "--framerate", str(FPS),
-            "--width", str(RES_W), "--height", str(RES_H),
+            "-t", str(duration_ms),
+            "--framerate", str(fps),
+            "--width", str(w), "--height", str(h),
             "--bitrate", str(BITRATE),
             *RPICAM_AF_OPTS,
             "--codec", "libav", "--libav-format", "mp4",
@@ -81,15 +93,14 @@ def record_video(ts, verbose=False, prefer_libav=True):
             vprint(verbose, f"Direct MP4 recorded: {mp4_path}")
             return str(mp4_path)
         else:
-            vprint(verbose, "Direct MP4 failed or empty; will fall back to h264+mux…")
+            vprint(verbose, "Direct MP4 failed or empty; falling back to h264+mux…")
 
-    # Fallback path
     vprint(verbose, "Recording raw H.264 stream…")
     rec = run([
         "rpicam-vid",
-        "-t", str(DURATION_MS),
-        "--framerate", str(FPS),
-        "--width", str(RES_W), "--height", str(RES_H),
+        "-t", str(duration_ms),
+        "--framerate", str(fps),
+        "--width", str(w), "--height", str(h),
         "--bitrate", str(BITRATE),
         *RPICAM_AF_OPTS,
         "-o", str(h264_path),
@@ -100,7 +111,7 @@ def record_video(ts, verbose=False, prefer_libav=True):
     vprint(verbose, "Muxing H.264 → MP4 (ffmpeg, stream copy)…")
     mux = run([
         "ffmpeg", "-y",
-        "-framerate", str(FPS),
+        "-framerate", str(fps),
         "-i", str(h264_path),
         "-c", "copy",
         str(mp4_path)
@@ -108,10 +119,8 @@ def record_video(ts, verbose=False, prefer_libav=True):
     if mux.returncode != 0 or not mp4_path.exists():
         raise RuntimeError(f"MP4 mux failed.\n{mux.stderr}")
 
-    try:
-        h264_path.unlink()
-    except Exception:
-        pass
+    try: h264_path.unlink()
+    except Exception: pass
 
     vprint(verbose, f"Final MP4: {mp4_path}")
     return str(mp4_path)
@@ -121,7 +130,7 @@ def extract_last_frame(mp4_path, ts, verbose=False):
     vprint(verbose, "Extracting last frame (~0.1s before end) as JPEG…")
     res = run([
         "ffmpeg", "-y",
-        "-sseof", "-0.1",   # a hair before end avoids EOF boundary issues
+        "-sseof", "-0.1",   # slightly before end avoids boundary issues
         "-i", mp4_path,
         "-vframes", "1",
         "-q:v", "2",
@@ -132,93 +141,161 @@ def extract_last_frame(mp4_path, ts, verbose=False):
     vprint(verbose, f"Last frame: {jpg_path}")
     return str(jpg_path)
 
-# ---------------- Dice classifier (pips) ----------------
-def classify_die_pips(img_bgr, verbose=False):
-    """
-    Returns 1..6 if found, else None. Verbose prints stages if requested.
-    """
-    img = img_bgr.copy()
+# ---------------- OCR-only Classifier ----------------
+def resize_max_side(img, max_side):
     h, w = img.shape[:2]
-    vprint(verbose, f"Classifier: input image {w}x{h}")
+    if max(h, w) <= max_side:
+        return img, 1.0
+    scale = max_side / float(max(h, w))
+    out = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+    return out, scale
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
-    edged = cv2.Canny(gray, 50, 150)
-    edged = cv2.dilate(edged, np.ones((3,3), np.uint8), 1)
+def center_crop(img, frac):
+    if not (0.3 <= frac <= 1.0):
+        return img
+    h, w = img.shape[:2]
+    cx, cy = w//2, h//2
+    rx, ry = int(w*frac/2), int(h*frac/2)
+    x1, y1, x2, y2 = max(0,cx-rx), max(0,cy-ry), min(w,cx+rx), min(h,cy+ry)
+    return img[y1:y2, x1:x2]
 
-    cnts, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    face_quad = None
-    max_area = 0
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < (h*w)*0.01:
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02*peri, True)
-        if len(approx) == 4 and area > max_area and cv2.isContourConvex(approx):
-            max_area = area
-            face_quad = approx
+def ocr_digits_single(img_bgr, psm=6, inv=False, verbose=False):
+    """Run Tesseract OCR on a single preprocessed image."""
+    if not HAVE_TESS:
+        vprint(verbose, "OCR skipped: pytesseract/tesseract not installed.")
+        return None, ""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    if inv:
+        gray = 255 - gray
+    config = f"--oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789"
+    txt = pytesseract.image_to_string(gray, config=config).strip()
+    if verbose: print(f"  OCR(psm={psm}, inv={inv}) -> [{txt}]", flush=True)
+    return txt, config
 
-    if face_quad is not None:
-        pts = face_quad.reshape(4,2).astype(np.float32)
-        s = pts.sum(axis=1)
-        diff = np.diff(pts, axis=1).reshape(-1)
-        tl = pts[np.argmin(s)]; br = pts[np.argmax(s)]
-        tr = pts[np.argmin(diff)]; bl = pts[np.argmax(diff)]
-        dst_size = 300
-        dst = np.array([[0,0],[dst_size-1,0],[dst_size-1,dst_size-1],[0,dst_size-1]], dtype=np.float32)
-        M = cv2.getPerspectiveTransform(np.array([tl,tr,br,bl], dtype=np.float32), dst)
-        face = cv2.warpPerspective(img, M, (dst_size, dst_size))
-        vprint(verbose, "Classifier: warped quadrilateral to square.")
-    else:
-        face = img
-        vprint(verbose, "Classifier: no quad found; using full frame.")
-
-    face_gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    face_gray = cv2.equalizeHist(face_gray)
-    th = cv2.adaptiveThreshold(face_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY_INV, 31, 7)
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
-
-    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    h2, w2 = th.shape[:2]
-    minA = (h2*w2)*0.001
-    maxA = (h2*w2)*0.05
-    pip_cnt = 0
-    for c in cnts:
-        A = cv2.contourArea(c)
-        if A < minA or A > maxA:
-            continue
-        P = cv2.arcLength(c, True)
-        if P == 0:
-            continue
-        circularity = 4*np.pi*A/(P*P)
-        if circularity > 0.5:
-            pip_cnt += 1
-
-    if 1 <= pip_cnt <= 6:
-        vprint(verbose, f"Classifier: pips via contours = {pip_cnt}")
-        return pip_cnt
-
-    # Fallback to Hough circles
-    circles = cv2.HoughCircles(face_gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=h2//10,
-                               param1=60, param2=18, minRadius=h2//30, maxRadius=h2//6)
-    if circles is not None:
-        n = circles.shape[1]
-        vprint(verbose, f"Classifier: pips via Hough = {n}")
-        if 1 <= n <= 6:
-            return int(n)
-
-    vprint(verbose, "Classifier: no valid pip count found.")
+def parse_numeric(txt, allow_zero=False, max_face=20, percentile=False):
+    """
+    Return int if 1..max_face (or 0 if allow_zero).
+    Special handling:
+      - percentile=True: map '00' to 100 (or 0 if allow_zero=True)
+    """
+    if not txt:
+        return None
+    # Keep only digits
+    digits = "".join(ch for ch in txt if ch.isdigit())
+    if digits == "" and not allow_zero:
+        return None
+    # Handle percentile '00'
+    if percentile and digits in ("00", "000"):
+        return 100 if not allow_zero else 0
+    try:
+        n = int(digits) if digits != "" else 0
+    except Exception:
+        return None
+    # Range filter
+    if allow_zero and n == 0:
+        return 0
+    if 1 <= n <= max_face or (percentile and n in (10,20,30,40,50,60,70,80,90,100)):
+        return n
     return None
 
-def classify_image(jpg_path, verbose=False):
-    vprint(verbose, f"Loading image for classification: {jpg_path}")
-    img = cv2.imread(jpg_path)
-    if img is None:
-        vprint(verbose, "Failed to load image.")
+def enhance_for_ocr(img_bgr, mode, verbose=False):
+    """
+    Create OCR-friendly views.
+    mode:
+      'bw'       -> Otsu
+      'clahe'    -> CLAHE + Otsu
+      'tophat'   -> white tophat + Otsu
+      'morph'    -> opening to remove noise
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    if mode == "bw":
+        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    if mode == "clahe":
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        g2 = clahe.apply(gray)
+        _, bw = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    if mode == "tophat":
+        kernel = np.ones((9,9), np.uint8)
+        top = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+        _, bw = cv2.threshold(top, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    if mode == "morph":
+        g2 = cv2.medianBlur(gray, 3)
+        opn = cv2.morphologyEx(g2, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
+        _, bw = cv2.threshold(opn, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    return img_bgr
+
+def progressive_ocr(jpg_path, verbose=False,
+                    roi_step_sequence=(0.6, 0.8, 1.0),
+                    max_side_sequence=(480, 640, 960, 1280),
+                    total_budget_ms=1500,
+                    allow_zero=False,
+                    max_face=20,
+                    percentile=False,
+                    save_debug_images=True):
+    """
+    Progressive numbers-only classifier:
+      - Verifies exact _last.jpg path
+      - For each (ROI frac, max side):
+          * Crop center, downscale
+          * Generate multiple preprocess variants
+          * OCR with various PSMs and inversion
+      - Accept first numeric in allowed range
+    """
+    t0 = ms()
+    vprint(verbose, f"[OCR] Start classification on: {jpg_path}")
+    img_full = cv2.imread(jpg_path)
+    if img_full is None:
+        vprint(verbose, "[OCR] Could not load image.")
         return None
-    return classify_die_pips(img, verbose=verbose)
+
+    dbg_dir = Path(jpg_path).with_suffix("")
+    if save_debug_images:
+        Path(str(dbg_dir) + "_dbg").mkdir(parents=True, exist_ok=True)
+
+    preprocess_modes = ["bw", "clahe", "tophat", "morph"]
+    psms = [6, 7, 8, 10, 11, 13]  # single block, sparse, etc.
+
+    stage_idx = 0
+    for roi_frac in roi_step_sequence:
+        for max_side in max_side_sequence:
+            if not within_budget(t0, total_budget_ms):
+                vprint(verbose, f"[OCR] Time budget exceeded at stage {stage_idx}.")
+                return None
+            stage_idx += 1
+            vprint(verbose, f"[OCR] Stage {stage_idx}: roi={roi_frac}, max_side={max_side}")
+
+            img_roi = center_crop(img_full, roi_frac)
+            img_small, scale = resize_max_side(img_roi, max_side)
+
+            if save_debug_images:
+                save_debug(img_roi, Path(str(dbg_dir) + f"_dbg/roi_{stage_idx}.jpg"), verbose)
+                save_debug(img_small, Path(str(dbg_dir) + f"_dbg/roi_small_{stage_idx}.jpg"), verbose)
+
+            # Try preprocess variants (normal & inverted)
+            for mode in preprocess_modes:
+                if not within_budget(t0, total_budget_ms): break
+                proc = enhance_for_ocr(img_small, mode, verbose)
+                if save_debug_images:
+                    save_debug(proc, Path(str(dbg_dir) + f"_dbg/{mode}_{stage_idx}.png"), verbose)
+
+                for inv in (False, True):
+                    if not within_budget(t0, total_budget_ms): break
+                    for psm in psms:
+                        if not within_budget(t0, total_budget_ms): break
+                        txt, cfg = ocr_digits_single(proc, psm=psm, inv=inv, verbose=verbose)
+                        n = parse_numeric(txt, allow_zero=allow_zero, max_face=max_face, percentile=percentile)
+                        if n is not None:
+                            vprint(verbose, f"[OCR] ✓ RESULT: {n} (mode={mode}, inv={inv}, psm={psm})")
+                            return n
+
+            vprint(verbose, f"[OCR] Stage {stage_idx} no result; expanding… (elapsed {elapsed_ms(t0)} ms)")
+
+    vprint(verbose, f"[OCR] No classification result (total {elapsed_ms(t0)} ms).")
+    return None
 
 # ---------------- Discord upload ----------------
 def post_to_discord(webhook_url, mp4_path, jpg_path, roll_result, verbose=False):
@@ -246,68 +323,96 @@ def post_to_discord(webhook_url, mp4_path, jpg_path, roll_result, verbose=False)
         vprint(verbose, f"Discord post error: {e}")
         return False
 
+# ---------------- Countdown ----------------
 def countdown(verbose=False):
-    # Clear a beat so you have time to ready the dice
     vprint(verbose, "\nGet ready…")
     for n in [3, 2, 1]:
         print(f"{n}…", flush=True)
         time.sleep(1)
-    print("Roll the dice!", flush=True)  # Recording starts immediately after this returns.
+    print("Roll the dice!", flush=True)  # recording starts immediately after this returns
 
+# ---------------- Main ----------------
 def main():
-    # MUST be first so any reference below is to the global vars
     global FPS, RES_W, RES_H, DURATION_MS
 
     parser = argparse.ArgumentParser(
-        description="Record Pi Camera, grab last frame, classify pips, (optionally) post to Discord."
+        description="Record Pi Camera, make MP4, grab last frame, OCR-only classify numbers, post to Discord."
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--no-discord", action="store_true", help="Skip Discord upload even if webhook is set.")
-    parser.add_argument("--no-classify", action="store_true", help="Skip pip classification.")
+    parser.add_argument("--no-classify", action="store_true", help="Skip classification step.")
 
-    # Use literal defaults here to avoid referencing the globals before declaration
+    # capture params (literal defaults to avoid global scoping issues)
     parser.add_argument("--fps", type=int, default=30, help="Frames per second (default 30).")
     parser.add_argument("--width", type=int, default=1920, help="Video width (default 1920).")
     parser.add_argument("--height", type=int, default=1080, help="Video height (default 1080).")
     parser.add_argument("--duration-ms", type=int, default=7000, help="Duration in ms (default 7000).")
 
+    # OCR tuning
+    parser.add_argument("--ocr-budget", type=int, default=1500, help="Total OCR time budget (ms).")
+    parser.add_argument("--max-face", type=int, default=20, help="Max face value (e.g., 20 for d20, 12 for d12, 100 for percentile).")
+    parser.add_argument("--allow-zero", action="store_true", help="Allow 0 as valid result (e.g., some rules for percentile).")
+    parser.add_argument("--percentile", action="store_true", help="Treat '00' as 100 (or 0 if --allow-zero).")
+    parser.add_argument("--roi-seq", type=str, default="0.6,0.8,1.0",
+                        help="ROI center crop fractions in order (comma).")
+    parser.add_argument("--maxside-seq", type=str, default="480,640,960,1280",
+                        help="Max-side sizes in order (comma).")
+
     args = parser.parse_args()
     verbose = args.verbose
 
-    # Now it's safe to update the globals with CLI overrides
+    # apply CLI capture overrides
     FPS, RES_W, RES_H, DURATION_MS = args.fps, args.width, args.height, args.duration_ms
 
-    # Basic deps sanity
+    # deps
     if shutil.which("rpicam-vid") is None:
-        print("Error: rpicam-vid not found. Install rpicam-apps.", file=sys.stderr)
-        sys.exit(1)
+        print("Error: rpicam-vid not found. Install rpicam-apps.", file=sys.stderr); sys.exit(1)
     if shutil.which("ffmpeg") is None:
-        print("Error: ffmpeg not found. Install ffmpeg.", file=sys.stderr)
-        sys.exit(1)
+        print("Error: ffmpeg not found. Install ffmpeg.", file=sys.stderr); sys.exit(1)
+    if not HAVE_TESS and not args.no_classify:
+        print("Warning: pytesseract/tesseract-ocr not found; OCR will be skipped.", file=sys.stderr)
 
-    # Ctrl+C graceful exit
+    # Ctrl+C graceful
     signal.signal(signal.SIGINT, lambda *a: sys.exit(130))
+
+    # parse sequences
+    try:
+        roi_seq = [float(x.strip()) for x in args.roi_seq.split(",") if x.strip()]
+        maxside_seq = [int(x.strip()) for x in args.maxside_seq.split(",") if x.strip()]
+    except Exception:
+        print("Bad --roi-seq or --maxside-seq format.", file=sys.stderr); sys.exit(2)
 
     ts = nowtag()
 
-    # Countdown then IMMEDIATELY start recording
+    # countdown → record immediately
     countdown(verbose=verbose)
 
     try:
-        mp4_path = record_video(ts, verbose=verbose, prefer_libav=True)
+        mp4_path = record_video(ts, verbose=verbose, prefer_libav=True, fps=FPS, w=RES_W, h=RES_H, duration_ms=DURATION_MS)
     except Exception as e:
-        print(f"Capture error: {e}", file=sys.stderr, flush=True)
-        sys.exit(2)
+        print(f"Capture error: {e}", file=sys.stderr, flush=True); sys.exit(3)
 
     try:
         jpg_path = extract_last_frame(mp4_path, ts, verbose=verbose)
     except Exception as e:
-        print(f"Last-frame extract error: {e}", file=sys.stderr, flush=True)
-        sys.exit(3)
+        print(f"Last-frame extract error: {e}", file=sys.stderr, flush=True); sys.exit(4)
+
+    # explicitly confirm we’re classifying the exact _last.jpg we saved
+    print(f"Classifying exactly: {jpg_path}", flush=True)
 
     roll = None
     if not args.no_classify:
-        roll = classify_image(jpg_path, verbose=verbose)
+        roll = progressive_ocr(
+            jpg_path,
+            verbose=verbose,
+            roi_step_sequence=roi_seq,
+            max_side_sequence=maxside_seq,
+            total_budget_ms=args.ocr_budget,
+            allow_zero=args.allow_zero,
+            max_face=args.max_face,
+            percentile=args.percentile,
+            save_debug_images=True
+        )
         print(f"Detected roll: {roll}", flush=True)
 
     posted = False
