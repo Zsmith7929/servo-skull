@@ -255,6 +255,10 @@ def countdown(verbose=False):
     print("Roll the dice!", flush=True)  # Recording starts immediately after this returns.
 
 def main():
+
+    global FPS, RES_W, RES_H, DURATION_MS
+    #todo: store them as loclas and pass to record_video() instead
+
     parser = argparse.ArgumentParser(description="Record Pi Camera, grab last frame, classify pips, (optionally) post to Discord.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--no-discord", action="store_true", help="Skip Discord upload even if webhook is set.")
