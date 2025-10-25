@@ -2,6 +2,7 @@
 import os, sys, subprocess, time, signal, argparse
 from datetime import datetime
 from pathlib import Path
+import re
 
 import requests
 
@@ -93,17 +94,62 @@ def shutil_which(name):
     return which(name) is not None
 
 # ---------- Gemini ----------
-def parse_int(text, max_face):
-    import re
+
+def parse_roll_expression(text: str, max_face: int):
+    """
+    Accepts outputs like:
+      - '12'
+      - '5+4+6=15'
+      - '3+unknown+5=8+'
+      - 'unknown'
+    Returns a display string exactly as we want to show it (e.g., '5+4+6=15'),
+    plus (values_list, total, unknown_count).
+    """
     s = (text or "").strip().lower()
+
+    # If model says unknown outright
     if s == "unknown":
-        return None
-    m = re.search(r"\b(\d{1,3})\b", s)
-    if not m: return None
-    n = int(m.group(1))
-    if (1 <= n <= max_face) or (max_face == 100 and 1 <= n <= 100):
-        return n
-    return None
+        return "unknown", [], 0, 1
+
+    # Extract tokens in order
+    tokens = re.findall(r"(unknown|\d{1,3})", s)
+    values = []
+    unknowns = 0
+    for tok in tokens:
+        if tok == "unknown":
+            unknowns += 1
+        else:
+            n = int(tok)
+            # Keep only plausible values (<= max_face, allow 100 for d100)
+            if (1 <= n <= max_face) or (max_face == 100 and 1 <= n <= 100):
+                values.append(n)
+
+    if not values and unknowns == 0:
+        # nothing usable; assume unknown
+        return "unknown", [], 0, 1
+
+    # Build the left-hand side like "5+4+unknown+6"
+    lhs_parts = [str(v) for v in values]
+    lhs_parts += ["unknown"] * unknowns
+    lhs = "+".join(lhs_parts) if lhs_parts else "unknown"
+
+    # Compute sum of known values
+    total = sum(values)
+
+    # If no dice were readable, just say unknown
+    if not values and unknowns > 0:
+        return "unknown", [], 0, unknowns
+
+    # If we have at least one known value:
+    # - If there are unknowns, append '+' after the sum: "3+unknown+5=8+"
+    # - Otherwise print normal sum: "5+4+6=15"
+    if unknowns > 0:
+        display = f"{lhs}={total}+"
+    else:
+        # If only a single value, it's fine to return just that number
+        display = f"{lhs}={total}" if len(values) > 1 else f"{values[0]}"
+
+    return display, values, total, unknowns
 
 def read_with_gemini(image_path, max_face=20, verbose=False):
     if not GEMINI_API_KEY:
@@ -111,7 +157,6 @@ def read_with_gemini(image_path, max_face=20, verbose=False):
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # Upload file (per SDK docs) and generate
     file_ref = client.files.upload(file=image_path)
     if verbose:
         print(f"[upload] name={file_ref.name} uri={getattr(file_ref, 'uri', None)}")
@@ -119,25 +164,34 @@ def read_with_gemini(image_path, max_face=20, verbose=False):
     contents = [
         types.Part.from_text(text=INSTRUCTION),
         file_ref,
-        types.Part.from_text(
-        text=f"Die type d{max_face}. If a side face looks clearer but is not horizontal, IGNORE it and output the top (horizontal) face only."
-    ),
+        types.Part.from_text(text=f"Die type: d{max_face}. If multiple dice are present, output 'a+b+...=sum'. Use 'unknown' for unreadable dice."),
     ]
     resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+
     text = (getattr(resp, "text", None) or getattr(resp, "output_text", "") or "").strip()
     if verbose:
         print(f"[model] {text}")
-    n = parse_int(text, max_face)
-    if n is None:
-        raise RuntimeError(f"Model did not return a valid integer. Raw: {text!r}")
-    return n, text
+
+    display, values, total, unknowns = parse_roll_expression(text, max_face)
+    if display == "unknown":
+        # surface the raw for debugging if needed
+        if verbose:
+            print(f"[parse] unknown (raw: {text!r})")
+        return display, text  # 'unknown', raw text
+
+    return display, text  # e.g., '5+4+6=15'
 
 # ---------- Discord ----------
 def post_image_to_discord(webhook_url, image_path, roll, verbose=False):
     if not webhook_url:
         vprint(verbose, "No DISCORD_WEBHOOK_URL set; skipping Discord post.")
         return False
-    content = f" **OCR disabled. Gemini thinks this roll is:** {roll}"
+
+    if str(roll).lower() == "unknown":
+        content = "🤔 Gemini couldn't quite tell — maybe it’s cocked?"
+    else:
+        content = f"🎲 Gemini thinks this roll is **{roll}**"
+
     files = []
     try:
         files.append(("files[0]", (os.path.basename(image_path), open(image_path, "rb"), "image/jpeg")))
