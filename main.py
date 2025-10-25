@@ -217,41 +217,78 @@ def center_crop(img, frac):
 
 def crop_to_digit_cluster(img_bgr):
     """
-    Use MSER to find text-like regions; crop around the best cluster near center.
-    Lightweight cue to isolate the top face's numerals.
+    Use MSER to find a glyph-like region, prefer near-center, crop tightly with padding.
+    Falls back to a contour-based method if MSER returns nothing or isn't available.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # MSER parameters tuned for numerals; adjust if needed
-    mser = cv2.MSER_create(_delta=5, _min_area=60, _max_area=6000)
-    regions, _ = mser.detectRegions(gray)
 
-    if not regions:
+    # --- Try MSER (positional args to avoid keyword incompatibility) ---
+    regions = None
+    try:
+        # delta=5, min_area=60, max_area=5000 (tweak if needed)
+        mser = cv2.MSER_create(5, 60, 5000)
+        regions, _ = mser.detectRegions(gray)
+    except Exception:
+        regions = None
+
+    h, w = gray.shape[:2]
+    cx, cy = w // 2, h // 2
+
+    def crop_from_regions(regs):
+        if not regs:
+            return None
+        best_rect, best_score = None, 1e12
+        for r in regs:
+            x, y, w2, h2 = cv2.boundingRect(r.reshape(-1, 1, 2))
+            center_dist = ((x + w2 / 2 - cx) ** 2 + (y + h2 / 2 - cy) ** 2) ** 0.5
+            aspect_penalty = abs((w2 / max(h2, 1e-3)) - 0.7)  # soft preference for digit-ish boxes
+            score = center_dist + 50 * aspect_penalty
+            if score < best_score:
+                best_score, best_rect = score, (x, y, w2, h2)
+        if best_rect is None:
+            return None
+        x, y, w2, h2 = best_rect
+        pad = int(0.25 * max(w2, h2))
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(img_bgr.shape[1], x + w2 + pad), min(img_bgr.shape[0], y + h2 + pad)
+        return img_bgr[y1:y2, x1:x2]
+
+    # If MSER produced something, crop from it
+    if regions:
+        cropped = crop_from_regions(regions)
+        if cropped is not None:
+            return cropped
+
+    # --- Fallback: simple contour-based glyph guess near center ---
+    # Adaptive threshold to pull strokes; adjust blockSize/C if needed
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY_INV, 31, 7)
+    # clean small noise
+    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return img_bgr
 
-    H, W = gray.shape[:2]
-    cx, cy = W/2.0, H/2.0
-
     best_rect, best_score = None, 1e12
-    for r in regions:
-        x, y, w, h = cv2.boundingRect(r.reshape(-1,1,2))
-        if w*h < 80:  # very small specks
+    for cnt in contours:
+        x, y, w2, h2 = cv2.boundingRect(cnt)
+        area = w2 * h2
+        if area < 60 or area > 8000:  # filter extremes
             continue
-        # Score: near center + moderately tall boxes are preferred
-        center_dist = np.hypot((x + w/2) - cx, (y + h/2) - cy)
-        aspect = w / max(h, 1)
-        aspect_penalty = abs(aspect - 0.7)  # many dice numerals are slightly tall
+        center_dist = ((x + w2 / 2 - cx) ** 2 + (y + h2 / 2 - cy) ** 2) ** 0.5
+        aspect_penalty = abs((w2 / max(h2, 1e-3)) - 0.7)
         score = center_dist + 50 * aspect_penalty
         if score < best_score:
-            best_score = score
-            best_rect = (x, y, w, h)
+            best_score, best_rect = score, (x, y, w2, h2)
 
     if best_rect is None:
         return img_bgr
 
-    x, y, w, h = best_rect
-    pad = int(0.25 * max(w, h))
+    x, y, w2, h2 = best_rect
+    pad = int(0.25 * max(w2, h2))
     x1, y1 = max(0, x - pad), max(0, y - pad)
-    x2, y2 = min(W, x + w + pad), min(H, y + h + pad)
+    x2, y2 = min(img_bgr.shape[1], x + w2 + pad), min(img_bgr.shape[0], y + h2 + pad)
     return img_bgr[y1:y2, x1:x2]
 
 def ocr_digits_single(img_bgr, psm=6, inv=False, force_no_invert=False, verbose=False):
