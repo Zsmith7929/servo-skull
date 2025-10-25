@@ -255,24 +255,26 @@ def countdown(verbose=False):
     print("Roll the dice!", flush=True)  # Recording starts immediately after this returns.
 
 def main():
-
+    # MUST be first so any reference below is to the global vars
     global FPS, RES_W, RES_H, DURATION_MS
-    #todo: store them as loclas and pass to record_video() instead
 
-    parser = argparse.ArgumentParser(description="Record Pi Camera, grab last frame, classify pips, (optionally) post to Discord.")
+    parser = argparse.ArgumentParser(
+        description="Record Pi Camera, grab last frame, classify pips, (optionally) post to Discord."
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--no-discord", action="store_true", help="Skip Discord upload even if webhook is set.")
     parser.add_argument("--no-classify", action="store_true", help="Skip pip classification.")
-    parser.add_argument("--fps", type=int, default=FPS, help="Frames per second (default 30).")
-    parser.add_argument("--width", type=int, default=RES_W, help="Video width (default 1920).")
-    parser.add_argument("--height", type=int, default=RES_H, help="Video height (default 1080).")
-    parser.add_argument("--duration-ms", type=int, default=DURATION_MS, help="Duration in ms (default 7000).")
-    args = parser.parse_args()
 
+    # Use literal defaults here to avoid referencing the globals before declaration
+    parser.add_argument("--fps", type=int, default=30, help="Frames per second (default 30).")
+    parser.add_argument("--width", type=int, default=1920, help="Video width (default 1920).")
+    parser.add_argument("--height", type=int, default=1080, help="Video height (default 1080).")
+    parser.add_argument("--duration-ms", type=int, default=7000, help="Duration in ms (default 7000).")
+
+    args = parser.parse_args()
     verbose = args.verbose
 
-    # Allow quick overrides from CLI
-    global FPS, RES_W, RES_H, DURATION_MS
+    # Now it's safe to update the globals with CLI overrides
     FPS, RES_W, RES_H, DURATION_MS = args.fps, args.width, args.height, args.duration_ms
 
     # Basic deps sanity
