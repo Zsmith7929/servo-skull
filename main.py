@@ -398,26 +398,44 @@ def enhance_gold_on_dark(img_bgr):
     bw = cv2.morphologyEx(bw, cv2.MORPH_DILATE, np.ones((2,2), np.uint8), iterations=1)
     return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
-def progressive_ocr(
-    jpg_path,
-    verbose=False,
-    roi_step_sequence=(0.6, 0.8, 1.0),
-    max_side_sequence=(480, 640, 960, 1280),
-    total_budget_ms=1500,
-    allow_zero=False,
-    max_face=20,
-    percentile=False,
-    save_debug_images=True
-):
+def rotate_bound(img, angle_deg):
+    (h, w) = img.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    cos = abs(M[0,0]); sin = abs(M[0,1])
+    nw = int((h*sin) + (w*cos))
+    nh = int((h*cos) + (w*sin))
+    M[0,2] += (nw/2) - center[0]
+    M[1,2] += (nh/2) - center[1]
+    return cv2.warpAffine(img, M, (nw, nh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+def unsharp_mask(img_bgr, blur_ks=5, amount=1.2):
+    blur = cv2.GaussianBlur(img_bgr, (blur_ks, blur_ks), 0)
+    sharp = cv2.addWeighted(img_bgr, 1 + amount, blur, -amount, 0)
+    return np.clip(sharp, 0, 255).astype(np.uint8)
+
+def upsample(img_bgr, factor):
+    if abs(factor - 1.0) < 1e-3:
+        return img_bgr
+    h, w = img_bgr.shape[:2]
+    return cv2.resize(img_bgr, (int(w*factor), int(h*factor)), interpolation=cv2.INTER_CUBIC)
+
+def progressive_ocr(jpg_path, verbose=False,
+                    roi_step_sequence=(0.6, 0.8, 1.0),
+                    max_side_sequence=(480, 640, 960, 1280),
+                    total_budget_ms=1500,
+                    allow_zero=False,
+                    max_face=20,
+                    percentile=False,
+                    save_debug_images=True,
+                    heavy=False,
+                    rotations=(-12,-8,-4,0,4,8,12),
+                    upscales=(1.0,1.5,2.0)):
     """
-    Progressive numbers-only classifier:
-      - Verifies exact _last.jpg path
-      - For each (ROI frac, max side):
-          * Crop center, downscale
-          * (NEW) Digit-cluster crop via MSER
-          * Generate multiple preprocess variants (incl. goldmask)
-          * OCR with tuned PSMs and inversion strategy
-      - Accept first numeric in allowed range
+    Two-stage OCR:
+      1) Quick pass (short budget) using goldmask + standard preprocessors
+      2) Optional heavy pass (rotations, upscales, stronger sharpening, larger scales)
+    Stops immediately on the first valid numeric result.
     """
     t0 = ms()
     vprint(verbose, f"[OCR] Start classification on: {jpg_path}")
@@ -430,58 +448,93 @@ def progressive_ocr(
     if save_debug_images:
         Path(str(dbg_dir) + "_dbg").mkdir(parents=True, exist_ok=True)
 
-    # Try gold-masking first for metallic digits, then other robust modes
+    # ---------- Common config ----------
+    # Favor single-char/line first
+    psms_quick = [10, 13, 6, 7, 8, 11]
+    psms_heavy = [10, 13, 6, 7, 8, 11, 12, 3]  # add more just in case
     preprocess_modes = ["goldmask", "clahe", "tophat", "morph", "bw"]
-    # Favor single-character/line PSMS first, then more general
-    psms = [10, 13, 6, 7, 8, 11]  # 10=single char, 13=raw line, 6 block, etc.
 
-    stage_idx = 0
-    for roi_frac in roi_step_sequence:
-        for max_side in max_side_sequence:
-            if not within_budget(t0, total_budget_ms):
-                vprint(verbose, f"[OCR] Time budget exceeded at stage {stage_idx}.")
-                return None
-            stage_idx += 1
-            vprint(verbose, f"[OCR] Stage {stage_idx}: roi={roi_frac}, max_side={max_side}")
+    def try_ocr_on(img_bgr, stage_tag):
+        """Inner routine that runs the full preproc/psm loop on a given image crop."""
+        nonlocal t0
+        for mode in preprocess_modes:
+            if not within_budget(t0, total_budget_ms): return None
+            if mode == "goldmask":
+                proc = enhance_gold_on_dark(img_bgr); force_no_invert = True
+            else:
+                proc = enhance_for_ocr(img_bgr, mode, verbose); force_no_invert = False
 
-            img_roi = center_crop(img_full, roi_frac)
-            img_small, scale = resize_max_side(img_roi, max_side)
-
-            # NEW: try to focus on the numeral cluster
-            img_digits = crop_to_digit_cluster(img_small)
+            # optional sharpening helps thin strokes
+            proc = unsharp_mask(proc, blur_ks=5, amount=0.8)
 
             if save_debug_images:
-                save_debug(img_roi, Path(str(dbg_dir) + f"_dbg/roi_{stage_idx}.jpg"), verbose)
-                save_debug(img_small, Path(str(dbg_dir) + f"_dbg/roi_small_{stage_idx}.jpg"), verbose)
-                save_debug(img_digits, Path(str(dbg_dir) + f"_dbg/roi_digits_{stage_idx}.jpg"), verbose)
+                save_debug(proc, Path(str(dbg_dir) + f"_dbg/{stage_tag}_{mode}.png"), verbose)
 
-            # Try preprocess variants (normal & inverted where appropriate)
-            for mode in preprocess_modes:
+            inv_opts = (False,) if force_no_invert else (False, True)
+            psms = psms_quick if "quick" in stage_tag else psms_heavy
+
+            for inv in inv_opts:
+                if not within_budget(t0, total_budget_ms): return None
+                for psm in psms:
+                    if not within_budget(t0, total_budget_ms): return None
+                    txt, _ = ocr_digits_single(proc, psm=psm, inv=inv,
+                                               force_no_invert=force_no_invert, verbose=verbose)
+                    n = parse_numeric(txt, allow_zero=allow_zero, max_face=max_face, percentile=percentile)
+                    if n is not None:
+                        vprint(verbose, f"[OCR] ✓ RESULT: {n} ({stage_tag}, mode={mode}, inv={inv}, psm={psm})")
+                        return n
+        return None
+
+    # ---------- Pass 1: Quick (bounded) ----------
+    stage = 0
+    for roi_frac in roi_step_sequence:
+        for max_side in max_side_sequence:
+            if not within_budget(t0, total_budget_ms): break
+            stage += 1
+            img_roi = center_crop(img_full, roi_frac)
+            img_small, _ = resize_max_side(img_roi, max_side)
+            img_digits = crop_to_digit_cluster(img_small)
+            if save_debug_images:
+                save_debug(img_digits, Path(str(dbg_dir) + f"_dbg/quick_{stage}.jpg"), verbose)
+            res = try_ocr_on(img_digits, f"quick_s{stage}")
+            if res is not None:
+                return res
+
+    if not heavy:
+        vprint(verbose, f"[OCR] No result in quick pass (elapsed {elapsed_ms(t0)} ms).")
+        return None
+
+    # ---------- Pass 2: Heavy (rotations + upscales) ----------
+    # Add 4–8 seconds of budget for the heavy pass unless the user already raised it.
+    if total_budget_ms < 6000:
+        total_budget_ms += 6000  # extend budget just for this function call
+
+    vprint(verbose, "[OCR] Heavy pass enabled…")
+    stage = 0
+    for roi_frac in (0.7, 0.85, 1.0):  # slightly larger ROIs for safety
+        for max_side in list(max_side_sequence) + [1280, 1600]:  # push bigger scales
+            if not within_budget(t0, total_budget_ms): break
+            base_roi = center_crop(img_full, roi_frac)
+            base_small, _ = resize_max_side(base_roi, max_side)
+            digits = crop_to_digit_cluster(base_small)
+
+            # rotations × upscales grid
+            for ang in rotations:
                 if not within_budget(t0, total_budget_ms): break
-
-                if mode == "goldmask":
-                    proc = enhance_gold_on_dark(img_digits)
-                    force_no_invert = True  # we've already controlled inversion in this path
-                else:
-                    proc = enhance_for_ocr(img_digits, mode, verbose)
-                    force_no_invert = False
-
-                if save_debug_images:
-                    save_debug(proc, Path(str(dbg_dir) + f"_dbg/{mode}_{stage_idx}.png"), verbose)
-
-                for inv in ((False,) if force_no_invert else (False, True)):
+                rot = rotate_bound(digits, ang)
+                for us in upscales:
                     if not within_budget(t0, total_budget_ms): break
-                    for psm in psms:
-                        if not within_budget(t0, total_budget_ms): break
-                        txt, cfg = ocr_digits_single(
-                            proc, psm=psm, inv=inv, force_no_invert=force_no_invert, verbose=verbose
-                        )
-                        n = parse_numeric(txt, allow_zero=allow_zero, max_face=max_face, percentile=percentile)
-                        if n is not None:
-                            vprint(verbose, f"[OCR] ✓ RESULT: {n} (mode={mode}, inv={inv}, psm={psm})")
-                            return n
-
-            vprint(verbose, f"[OCR] Stage {stage_idx} no result; expanding… (elapsed {elapsed_ms(t0)} ms)")
+                    try:
+                        usf = float(us)
+                    except: 
+                        usf = 1.0
+                    cand = upsample(rot, usf)
+                    stage += 1
+                    if save_debug_images and stage <= 20:  # don’t spam disk
+                        save_debug(cand, Path(str(dbg_dir) + f"_dbg/heavy_{stage}_ang{ang}_x{usf}.jpg"), verbose)
+                    res = try_ocr_on(cand, f"heavy_s{stage}")
+                    if res is not None:
+                        return res
 
     vprint(verbose, f"[OCR] No classification result (total {elapsed_ms(t0)} ms).")
     return None
@@ -555,6 +608,11 @@ def main():
     parser.add_argument("--tail-window-s", type=float, default=0.6, help="Seconds from end to sample frames.")
     parser.add_argument("--tail-frames", type=int, default=10, help="Number of frames to sample from tail window.")
 
+    parser.add_argument("--ocr-budget", type=int, default=1500, help="Total OCR time budget (ms).")
+    parser.add_argument("--heavy-ocr", action="store_true", help="Enable heavy fallback pass if quick pass fails.")
+    parser.add_argument("--rotations", type=str, default="-12,-8,-4,0,4,8,12", help="Angles (deg) to try in heavy pass.")
+    parser.add_argument("--upscale", type=str, default="1.0,1.5,2.0", help="Upscale factors to try in heavy pass.")
+
     args = parser.parse_args()
     verbose = args.verbose
 
@@ -625,8 +683,12 @@ def main():
             allow_zero=args.allow_zero,
             max_face=args.max_face,
             percentile=args.percentile,
-            save_debug_images=True
+            save_debug_images=True,
+            heavy=args.heavy_ocr,
+            rotations=[int(a) for a in args.rotations.split(",") if a.strip()],
+            upscales=[float(u) for u in args.upscale.split(",") if u.strip()]
         )
+
         print(f"Detected roll: {roll}", flush=True)
 
     posted = False
