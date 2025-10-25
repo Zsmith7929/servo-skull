@@ -22,11 +22,11 @@ GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 INSTRUCTION = (
     "You are a die-reading assistant.\n"
-    "Identify the value on the TOP face of every visible die in the image.\n"
+    "Identify the value on the **highest, top-most face** of every visible die in the image.\n"
     "\n"
     "Rules:\n"
-    "1) For most dice (d6–d20, d10, d12, d20…), the correct face is the one facing UP (most horizontal), not the face pointing toward the camera.\n"
-    "2) The top face appears least foreshortened and most parallel to the ground. Ignore front-facing side faces.\n"
+    "1) The correct result is the number on the face that is pointing **straight up** and rests on the most **horizontal plane**. This is the face with the **highest elevation** and is the die's **apex**.\n"
+    "2) The true top face will appear least foreshortened and most parallel to the ground. **Crucially, ignore side faces** that are merely pointing toward the camera or are only close to the highest point.\n"
     "3) Digits may be rotated; orientation does not matter.\n"
     "4) For d4 (pyramid), report the number printed at the top TIP (upward-pointing vertex), not the base.\n"
     "5) If multiple dice are present, read each separately (order left→right).\n"
@@ -34,7 +34,7 @@ INSTRUCTION = (
     "OUTPUT FORMAT (mandatory):\n"
     "Return ONLY a JSON array with one element per die. Each element must be either an integer (the top value) or the string \"unknown\".\n"
     "No prose, no code fences, no keys, no math.\n"
-    "Examples: [12,4]   or   [3,\"unknown\",5]\n"
+    "Examples: [12,4]   or   [3,\"unknown\",5]\n"
 )
 # ============================================
 
