@@ -66,7 +66,19 @@ def save_debug(image, path, verbose=False):
         vprint(verbose, f"Failed to save debug {path}: {e}")
 
 # --------------- Recording / muxing ------------------
-def record_video(ts, verbose=False, prefer_libav=True, fps=FPS, w=RES_W, h=RES_H, duration_ms=DURATION_MS):
+def record_video(
+    ts,
+    verbose=False,
+    prefer_libav=True,
+    fps=FPS,
+    w=RES_W,
+    h=RES_H,
+    duration_ms=DURATION_MS,
+    shutter_us=10000,
+    gain=1.0,
+    awb="incandescent",
+    denoise="off"
+):
     """
     Record duration_ms and return path to finalized MP4.
     Falls back to raw .h264 + ffmpeg mux if libav isn't available.
@@ -76,15 +88,24 @@ def record_video(ts, verbose=False, prefer_libav=True, fps=FPS, w=RES_W, h=RES_H
 
     record_timeout = max(10, int(duration_ms/1000) + 8)
 
+    # common capture args
+    base_args = [
+        "--framerate", str(fps),
+        "--width", str(w), "--height", str(h),
+        "--bitrate", str(BITRATE),
+        *RPICAM_AF_OPTS,
+        "--shutter", str(int(shutter_us)),
+        "--gain", str(float(gain)),
+        "--awb", awb,
+        "--denoise", denoise,
+    ]
+
     if prefer_libav:
         vprint(verbose, "Trying direct MP4 with libav muxer…")
         cmd = [
             "rpicam-vid",
             "-t", str(duration_ms),
-            "--framerate", str(fps),
-            "--width", str(w), "--height", str(h),
-            "--bitrate", str(BITRATE),
-            *RPICAM_AF_OPTS,
+            *base_args,
             "--codec", "libav", "--libav-format", "mp4",
             "-o", str(mp4_path),
         ]
@@ -99,10 +120,7 @@ def record_video(ts, verbose=False, prefer_libav=True, fps=FPS, w=RES_W, h=RES_H
     rec = run([
         "rpicam-vid",
         "-t", str(duration_ms),
-        "--framerate", str(fps),
-        "--width", str(w), "--height", str(h),
-        "--bitrate", str(BITRATE),
-        *RPICAM_AF_OPTS,
+        *base_args,
         "-o", str(h264_path),
     ], verbose=verbose, timeout=record_timeout)
     if rec.returncode != 0 or not h264_path.exists():
@@ -126,11 +144,12 @@ def record_video(ts, verbose=False, prefer_libav=True, fps=FPS, w=RES_W, h=RES_H
     return str(mp4_path)
 
 def extract_last_frame(mp4_path, ts, verbose=False):
+    """Kept for compatibility; not used by default."""
     jpg_path = OUTDIR / f"dice_{ts}_last.jpg"
     vprint(verbose, "Extracting last frame (~0.1s before end) as JPEG…")
     res = run([
         "ffmpeg", "-y",
-        "-sseof", "-0.1",   # slightly before end avoids boundary issues
+        "-sseof", "-0.1",
         "-i", mp4_path,
         "-vframes", "1",
         "-q:v", "2",
@@ -139,6 +158,43 @@ def extract_last_frame(mp4_path, ts, verbose=False):
     if res.returncode != 0 or not jpg_path.exists():
         raise RuntimeError(f"Extract last frame failed:\n{res.stderr}")
     vprint(verbose, f"Last frame: {jpg_path}")
+    return str(jpg_path)
+
+def extract_best_tail_frame(mp4_path, ts, verbose=False, tail_window_s=0.6, n_frames=10):
+    """
+    Sample frames from the last tail_window_s seconds and pick the sharpest by Laplacian focus measure.
+    Saves to dice_{ts}_last.jpg that the pipeline expects.
+    """
+    tmpdir = OUTDIR / f"dice_{ts}_tail"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    pattern = str(tmpdir / "f_%02d.jpg")
+
+    # choose a reasonable sampling fps for the tail
+    sample_fps = max(2, int(np.ceil(n_frames / max(tail_window_s, 0.2))))
+    run([
+        "ffmpeg","-y","-sseof", f"-{tail_window_s}",
+        "-i", mp4_path, "-vf", f"fps={sample_fps}",
+        "-vframes", str(n_frames), pattern
+    ], verbose=verbose, timeout=45)
+
+    best_path, best_score = None, -1.0
+    for p in sorted(tmpdir.glob("f_*.jpg")):
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if img is None: continue
+        score = cv2.Laplacian(img, cv2.CV_64F).var()
+        if score > best_score:
+            best_score, best_path = score, p
+
+    if not best_path:
+        raise RuntimeError("No frames extracted for sharpness selection")
+
+    jpg_path = OUTDIR / f"dice_{ts}_last.jpg"
+    shutil.copy2(best_path, jpg_path)
+
+    try: shutil.rmtree(tmpdir)
+    except: pass
+
+    vprint(verbose, f"Selected sharpest tail frame (var={best_score:.1f}): {jpg_path}")
     return str(jpg_path)
 
 # ---------------- OCR-only Classifier ----------------
@@ -159,7 +215,46 @@ def center_crop(img, frac):
     x1, y1, x2, y2 = max(0,cx-rx), max(0,cy-ry), min(w,cx+rx), min(h,cy+ry)
     return img[y1:y2, x1:x2]
 
-def ocr_digits_single(img_bgr, psm=6, inv=False, verbose=False):
+def crop_to_digit_cluster(img_bgr):
+    """
+    Use MSER to find text-like regions; crop around the best cluster near center.
+    Lightweight cue to isolate the top face's numerals.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # MSER parameters tuned for numerals; adjust if needed
+    mser = cv2.MSER_create(_delta=5, _min_area=60, _max_area=6000)
+    regions, _ = mser.detectRegions(gray)
+
+    if not regions:
+        return img_bgr
+
+    H, W = gray.shape[:2]
+    cx, cy = W/2.0, H/2.0
+
+    best_rect, best_score = None, 1e12
+    for r in regions:
+        x, y, w, h = cv2.boundingRect(r.reshape(-1,1,2))
+        if w*h < 80:  # very small specks
+            continue
+        # Score: near center + moderately tall boxes are preferred
+        center_dist = np.hypot((x + w/2) - cx, (y + h/2) - cy)
+        aspect = w / max(h, 1)
+        aspect_penalty = abs(aspect - 0.7)  # many dice numerals are slightly tall
+        score = center_dist + 50 * aspect_penalty
+        if score < best_score:
+            best_score = score
+            best_rect = (x, y, w, h)
+
+    if best_rect is None:
+        return img_bgr
+
+    x, y, w, h = best_rect
+    pad = int(0.25 * max(w, h))
+    x1, y1 = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(W, x + w + pad), min(H, y + h + pad)
+    return img_bgr[y1:y2, x1:x2]
+
+def ocr_digits_single(img_bgr, psm=6, inv=False, force_no_invert=False, verbose=False):
     """Run Tesseract OCR on a single preprocessed image."""
     if not HAVE_TESS:
         vprint(verbose, "OCR skipped: pytesseract/tesseract not installed.")
@@ -167,7 +262,13 @@ def ocr_digits_single(img_bgr, psm=6, inv=False, verbose=False):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     if inv:
         gray = 255 - gray
-    config = f"--oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789"
+    config = (
+        f"--oem 1 --psm {psm} "
+        "-c tessedit_char_whitelist=0123456789 "
+        "-c classify_bln_numeric_mode=1"
+    )
+    if force_no_invert:
+        config += " -c tessedit_do_invert=0"
     txt = pytesseract.image_to_string(gray, config=config).strip()
     if verbose: print(f"  OCR(psm={psm}, inv={inv}) -> [{txt}]", flush=True)
     return txt, config
@@ -228,21 +329,57 @@ def enhance_for_ocr(img_bgr, mode, verbose=False):
         return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
     return img_bgr
 
-def progressive_ocr(jpg_path, verbose=False,
-                    roi_step_sequence=(0.6, 0.8, 1.0),
-                    max_side_sequence=(480, 640, 960, 1280),
-                    total_budget_ms=1500,
-                    allow_zero=False,
-                    max_face=20,
-                    percentile=False,
-                    save_debug_images=True):
+def enhance_gold_on_dark(img_bgr):
+    """
+    Specialized preprocessor for metallic gold digits on dark burgundy/purple dice.
+    Produces a text-like image with dark digits on light background.
+    """
+    # 1) HSV mask for yellow/gold
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    # Hue 10-35 (warm), S 60+, V 70+ — tune if needed
+    mask1 = cv2.inRange(hsv, (10, 60, 70), (35, 255, 255))
+
+    # 2) Reinforce with LAB b-channel (yellow high)
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    b = lab[:,:,2]
+    _, mask2 = cv2.threshold(b, 150, 255, cv2.THRESH_BINARY)  # tune 140–170
+
+    mask = cv2.bitwise_and(mask1, mask2)
+
+    # Clean mask
+    k = np.ones((3,3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    ink = cv2.bitwise_and(gray, gray, mask=mask)
+    ink = cv2.normalize(ink, None, 0, 255, cv2.NORM_MINMAX)
+    _, bw = cv2.threshold(ink, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+
+    # Invert so digits are dark on light
+    bw = 255 - bw
+    bw = cv2.morphologyEx(bw, cv2.MORPH_DILATE, np.ones((2,2), np.uint8), iterations=1)
+    return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+
+def progressive_ocr(
+    jpg_path,
+    verbose=False,
+    roi_step_sequence=(0.6, 0.8, 1.0),
+    max_side_sequence=(480, 640, 960, 1280),
+    total_budget_ms=1500,
+    allow_zero=False,
+    max_face=20,
+    percentile=False,
+    save_debug_images=True
+):
     """
     Progressive numbers-only classifier:
       - Verifies exact _last.jpg path
       - For each (ROI frac, max side):
           * Crop center, downscale
-          * Generate multiple preprocess variants
-          * OCR with various PSMs and inversion
+          * (NEW) Digit-cluster crop via MSER
+          * Generate multiple preprocess variants (incl. goldmask)
+          * OCR with tuned PSMs and inversion strategy
       - Accept first numeric in allowed range
     """
     t0 = ms()
@@ -256,8 +393,10 @@ def progressive_ocr(jpg_path, verbose=False,
     if save_debug_images:
         Path(str(dbg_dir) + "_dbg").mkdir(parents=True, exist_ok=True)
 
-    preprocess_modes = ["bw", "clahe", "tophat", "morph"]
-    psms = [6, 7, 8, 10, 11, 13]  # single block, sparse, etc.
+    # Try gold-masking first for metallic digits, then other robust modes
+    preprocess_modes = ["goldmask", "clahe", "tophat", "morph", "bw"]
+    # Favor single-character/line PSMS first, then more general
+    psms = [10, 13, 6, 7, 8, 11]  # 10=single char, 13=raw line, 6 block, etc.
 
     stage_idx = 0
     for roi_frac in roi_step_sequence:
@@ -271,22 +410,35 @@ def progressive_ocr(jpg_path, verbose=False,
             img_roi = center_crop(img_full, roi_frac)
             img_small, scale = resize_max_side(img_roi, max_side)
 
+            # NEW: try to focus on the numeral cluster
+            img_digits = crop_to_digit_cluster(img_small)
+
             if save_debug_images:
                 save_debug(img_roi, Path(str(dbg_dir) + f"_dbg/roi_{stage_idx}.jpg"), verbose)
                 save_debug(img_small, Path(str(dbg_dir) + f"_dbg/roi_small_{stage_idx}.jpg"), verbose)
+                save_debug(img_digits, Path(str(dbg_dir) + f"_dbg/roi_digits_{stage_idx}.jpg"), verbose)
 
-            # Try preprocess variants (normal & inverted)
+            # Try preprocess variants (normal & inverted where appropriate)
             for mode in preprocess_modes:
                 if not within_budget(t0, total_budget_ms): break
-                proc = enhance_for_ocr(img_small, mode, verbose)
+
+                if mode == "goldmask":
+                    proc = enhance_gold_on_dark(img_digits)
+                    force_no_invert = True  # we've already controlled inversion in this path
+                else:
+                    proc = enhance_for_ocr(img_digits, mode, verbose)
+                    force_no_invert = False
+
                 if save_debug_images:
                     save_debug(proc, Path(str(dbg_dir) + f"_dbg/{mode}_{stage_idx}.png"), verbose)
 
-                for inv in (False, True):
+                for inv in ((False,) if force_no_invert else (False, True)):
                     if not within_budget(t0, total_budget_ms): break
                     for psm in psms:
                         if not within_budget(t0, total_budget_ms): break
-                        txt, cfg = ocr_digits_single(proc, psm=psm, inv=inv, verbose=verbose)
+                        txt, cfg = ocr_digits_single(
+                            proc, psm=psm, inv=inv, force_no_invert=force_no_invert, verbose=verbose
+                        )
                         n = parse_numeric(txt, allow_zero=allow_zero, max_face=max_face, percentile=percentile)
                         if n is not None:
                             vprint(verbose, f"[OCR] ✓ RESULT: {n} (mode={mode}, inv={inv}, psm={psm})")
@@ -336,7 +488,7 @@ def main():
     global FPS, RES_W, RES_H, DURATION_MS
 
     parser = argparse.ArgumentParser(
-        description="Record Pi Camera, make MP4, grab last frame, OCR-only classify numbers, post to Discord."
+        description="Record Pi Camera, make MP4, grab sharpest tail frame, OCR-only classify numbers, post to Discord."
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--no-discord", action="store_true", help="Skip Discord upload even if webhook is set.")
@@ -348,15 +500,23 @@ def main():
     parser.add_argument("--height", type=int, default=1080, help="Video height (default 1080).")
     parser.add_argument("--duration-ms", type=int, default=7000, help="Duration in ms (default 7000).")
 
+    # NEW: exposure/denoise tweaks for crisp digits
+    parser.add_argument("--shutter-us", type=int, default=10000, help="Shutter in microseconds (e.g., 10000 ≈ 1/100s).")
+    parser.add_argument("--gain", type=float, default=1.0, help="Analog gain (ISO-ish).")
+    parser.add_argument("--awb", type=str, default="incandescent", help="AWB mode (auto, incandescent, daylight, etc.)")
+    parser.add_argument("--denoise", type=str, default="off", help="Denoise (off, cdn_off, cdn_fast, cdn_hq)")
+
     # OCR tuning
     parser.add_argument("--ocr-budget", type=int, default=1500, help="Total OCR time budget (ms).")
     parser.add_argument("--max-face", type=int, default=20, help="Max face value (e.g., 20 for d20, 12 for d12, 100 for percentile).")
     parser.add_argument("--allow-zero", action="store_true", help="Allow 0 as valid result (e.g., some rules for percentile).")
     parser.add_argument("--percentile", action="store_true", help="Treat '00' as 100 (or 0 if --allow-zero).")
-    parser.add_argument("--roi-seq", type=str, default="0.6,0.8,1.0",
-                        help="ROI center crop fractions in order (comma).")
-    parser.add_argument("--maxside-seq", type=str, default="480,640,960,1280",
-                        help="Max-side sizes in order (comma).")
+    parser.add_argument("--roi-seq", type=str, default="0.6,0.8,1.0", help="ROI center crop fractions in order (comma).")
+    parser.add_argument("--maxside-seq", type=str, default="480,640,960,1280", help="Max-side sizes in order (comma).")
+
+    # NEW: best-tail-frame extraction knobs
+    parser.add_argument("--tail-window-s", type=float, default=0.6, help="Seconds from end to sample frames.")
+    parser.add_argument("--tail-frames", type=int, default=10, help="Number of frames to sample from tail window.")
 
     args = parser.parse_args()
     verbose = args.verbose
@@ -388,14 +548,31 @@ def main():
     countdown(verbose=verbose)
 
     try:
-        mp4_path = record_video(ts, verbose=verbose, prefer_libav=True, fps=FPS, w=RES_W, h=RES_H, duration_ms=DURATION_MS)
+        mp4_path = record_video(
+            ts,
+            verbose=verbose,
+            prefer_libav=True,
+            fps=FPS,
+            w=RES_W,
+            h=RES_H,
+            duration_ms=DURATION_MS,
+            shutter_us=args.shutter_us,
+            gain=args.gain,
+            awb=args.awb,
+            denoise=args.denoise
+        )
     except Exception as e:
         print(f"Capture error: {e}", file=sys.stderr, flush=True); sys.exit(3)
 
     try:
-        jpg_path = extract_last_frame(mp4_path, ts, verbose=verbose)
+        # NEW: select sharpest tail frame
+        jpg_path = extract_best_tail_frame(
+            mp4_path, ts, verbose=verbose, tail_window_s=args.tail_window_s, n_frames=args.tail_frames
+        )
+        # If you prefer the old single-frame behavior, comment the block above and uncomment below:
+        # jpg_path = extract_last_frame(mp4_path, ts, verbose=verbose)
     except Exception as e:
-        print(f"Last-frame extract error: {e}", file=sys.stderr, flush=True); sys.exit(4)
+        print(f"Tail-frame extract error: {e}", file=sys.stderr, flush=True); sys.exit(4)
 
     # explicitly confirm we’re classifying the exact _last.jpg we saved
     print(f"Classifying exactly: {jpg_path}", flush=True)
