@@ -1,562 +1,137 @@
 #!/usr/bin/env python3
-import os, sys, shutil, subprocess, time, signal, argparse
+import os, sys, subprocess, time, signal, argparse
 from datetime import datetime
 from pathlib import Path
 
-import cv2
-import numpy as np
 import requests
 
-# OCR (required for this numbers-only build)
-try:
-    import pytesseract
-    HAVE_TESS = True
-except Exception:
-    HAVE_TESS = False
+# --- Gemini (Google GenAI) ---
+from google import genai
+from google.genai import types  # typed helpers
 
-# ================== DEFAULT CONFIG ==================
-DURATION_MS = 7000           # 7 seconds
-FPS         = 30
-RES_W, RES_H = 1920, 1080
-BITRATE     = 8_000_000      # ~8 Mbps
-
-# Autofocus tuned for close-ish work (Module 3)
-RPICAM_AF_OPTS = [
-    "--autofocus-mode", "auto",
-    "--autofocus-range", "macro",
-    # "--autofocus-speed", "fast",
-]
-
+# ================== CONFIG ==================
 OUTDIR = Path.home() / "dice_captures"
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-# =====================================================
 
-# ----------------- Utility helpers -------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+INSTRUCTION = (
+    "You are a precise die-reading assistant.\n"
+    "Look at the image of a single polyhedral die.\n"
+    "Decide which face is the TOP face (the result of the roll).\n"
+    "Return ONLY the Arabic numeral on the TOP face as an integer.\n"
+    "If unclear, return exactly: unknown"
+)
+# ============================================
+
 def nowtag():
+    from datetime import datetime
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def vprint(verbose, *a, **kw):
-    if verbose:
-        print(*a, **kw, flush=True)
+def vprint(verbose, *a):
+    if verbose: print(*a, flush=True)
 
 def run(cmd, verbose=False, timeout=None):
-    vprint(verbose, f"→ RUN: {' '.join(cmd)} (timeout={timeout})")
-    try:
-        res = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Command timed out: {' '.join(cmd)}")
+    vprint(verbose, f"→ RUN: {' '.join(cmd)}")
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
     if verbose:
         if res.stdout.strip(): print("  STDOUT:", res.stdout.strip(), flush=True)
         if res.stderr.strip(): print("  STDERR:", res.stderr.strip(), flush=True)
     return res
 
-def ms(): return int(time.time() * 1000)
-def elapsed_ms(t0): return ms() - t0
-def within_budget(t0, budget_ms): return elapsed_ms(t0) < budget_ms
+def countdown(verbose=False):
+    vprint(verbose, "\nGet ready…")
+    for n in [3, 2, 1]:
+        print(f"{n}…", flush=True); time.sleep(1)
+    print("Roll the dice!", flush=True)
 
-def save_debug(image, path, verbose=False):
-    try:
-        cv2.imwrite(str(path), image)
-        vprint(verbose, f"Saved debug: {path}")
-    except Exception as e:
-        vprint(verbose, f"Failed to save debug {path}: {e}")
-
-# --------------- Recording / muxing ------------------
-def record_video(
-    ts,
-    verbose=False,
-    prefer_libav=True,
-    fps=FPS,
-    w=RES_W,
-    h=RES_H,
-    duration_ms=DURATION_MS,
-    shutter_us=10000,
-    gain=1.0,
-    awb="incandescent",
-    denoise="off"
-):
+# ---------- Camera capture (defaults: AUTO exposure/AWB) ----------
+def capture_still(ts, w=1920, h=1080, quality=90, verbose=False):
     """
-    Record duration_ms and return path to finalized MP4.
-    Falls back to raw .h264 + ffmpeg mux if libav isn't available.
+    Captures a single JPEG using rpicam-still with default (auto) exposure/awb.
+    No manual shutter/gain—so images are bright and clean again.
     """
-    mp4_path  = OUTDIR / f"dice_{ts}.mp4"
-    h264_path = OUTDIR / f"dice_{ts}.h264"
+    jpg_path = OUTDIR / f"dice_{ts}_last.jpg"
 
-    record_timeout = max(10, int(duration_ms/1000) + 8)
+    if not shutil_which("rpicam-still"):
+        print("Error: rpicam-still not found. Install rpicam-apps.", file=sys.stderr)
+        sys.exit(1)
 
-    # common capture args
-    base_args = [
-        "--framerate", str(fps),
+    # Keep it minimal: autofocus on, auto exposure, auto white balance.
+    # Avoid passing --shutter/--gain/--awb so the camera chooses good brightness.
+    cmd = [
+        "rpicam-still",
+        "--timeout", "1200",              # ~1.2s to settle AF/exposure
+        "--autofocus-mode", "auto",
+        "--autofocus-range", "macro",
         "--width", str(w), "--height", str(h),
-        "--bitrate", str(BITRATE),
-        *RPICAM_AF_OPTS,
-        "--shutter", str(int(shutter_us)),
-        "--gain", str(float(gain)),
-        "--awb", awb,
-        "--denoise", denoise,
+        "--quality", str(quality),
+        "-o", str(jpg_path),
+        "--nopreview",
     ]
-
-    if prefer_libav:
-        vprint(verbose, "Trying direct MP4 with libav muxer…")
-        cmd = [
-            "rpicam-vid",
-            "-t", str(duration_ms),
-            *base_args,
-            "--codec", "libav", "--libav-format", "mp4",
-            "-o", str(mp4_path),
-        ]
-        res = run(cmd, verbose=verbose, timeout=record_timeout)
-        if res.returncode == 0 and mp4_path.exists() and mp4_path.stat().st_size > 0:
-            vprint(verbose, f"Direct MP4 recorded: {mp4_path}")
-            return str(mp4_path)
-        else:
-            vprint(verbose, "Direct MP4 failed or empty; falling back to h264+mux…")
-
-    vprint(verbose, "Recording raw H.264 stream…")
-    rec = run([
-        "rpicam-vid",
-        "-t", str(duration_ms),
-        *base_args,
-        "-o", str(h264_path),
-    ], verbose=verbose, timeout=record_timeout)
-    if rec.returncode != 0 or not h264_path.exists():
-        raise RuntimeError(f"Recording failed.\n{rec.stderr}")
-
-    vprint(verbose, "Muxing H.264 → MP4 (ffmpeg, stream copy)…")
-    mux = run([
-        "ffmpeg", "-y",
-        "-framerate", str(fps),
-        "-i", str(h264_path),
-        "-c", "copy",
-        str(mp4_path)
-    ], verbose=verbose, timeout=60)
-    if mux.returncode != 0 or not mp4_path.exists():
-        raise RuntimeError(f"MP4 mux failed.\n{mux.stderr}")
-
-    try: h264_path.unlink()
-    except Exception: pass
-
-    vprint(verbose, f"Final MP4: {mp4_path}")
-    return str(mp4_path)
-
-def extract_last_frame(mp4_path, ts, verbose=False):
-    """Kept for compatibility; not used by default."""
-    jpg_path = OUTDIR / f"dice_{ts}_last.jpg"
-    vprint(verbose, "Extracting last frame (~0.1s before end) as JPEG…")
-    res = run([
-        "ffmpeg", "-y",
-        "-sseof", "-0.1",
-        "-i", mp4_path,
-        "-vframes", "1",
-        "-q:v", "2",
-        str(jpg_path)
-    ], verbose=verbose, timeout=30)
-    if res.returncode != 0 or not jpg_path.exists():
-        raise RuntimeError(f"Extract last frame failed:\n{res.stderr}")
-    vprint(verbose, f"Last frame: {jpg_path}")
+    res = run(cmd, verbose=verbose, timeout=10)
+    if res.returncode != 0 or not jpg_path.exists() or jpg_path.stat().st_size == 0:
+        raise RuntimeError(f"Still capture failed.\n{res.stderr}")
+    vprint(verbose, f"Captured: {jpg_path}")
     return str(jpg_path)
 
-def extract_best_tail_frame(mp4_path, ts, verbose=False, tail_window_s=0.6, n_frames=10):
-    """
-    Sample frames from the last tail_window_s seconds and pick the sharpest by Laplacian focus measure.
-    Saves to dice_{ts}_last.jpg that the pipeline expects.
-    """
-    tmpdir = OUTDIR / f"dice_{ts}_tail"
-    tmpdir.mkdir(parents=True, exist_ok=True)
-    pattern = str(tmpdir / "f_%02d.jpg")
+def shutil_which(name):
+    from shutil import which
+    return which(name) is not None
 
-    # choose a reasonable sampling fps for the tail
-    sample_fps = max(2, int(np.ceil(n_frames / max(tail_window_s, 0.2))))
-    run([
-        "ffmpeg","-y","-sseof", f"-{tail_window_s}",
-        "-i", mp4_path, "-vf", f"fps={sample_fps}",
-        "-vframes", str(n_frames), pattern
-    ], verbose=verbose, timeout=45)
-
-    best_path, best_score = None, -1.0
-    for p in sorted(tmpdir.glob("f_*.jpg")):
-        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-        if img is None: continue
-        score = cv2.Laplacian(img, cv2.CV_64F).var()
-        if score > best_score:
-            best_score, best_path = score, p
-
-    if not best_path:
-        raise RuntimeError("No frames extracted for sharpness selection")
-
-    jpg_path = OUTDIR / f"dice_{ts}_last.jpg"
-    shutil.copy2(best_path, jpg_path)
-
-    try: shutil.rmtree(tmpdir)
-    except: pass
-
-    vprint(verbose, f"Selected sharpest tail frame (var={best_score:.1f}): {jpg_path}")
-    return str(jpg_path)
-
-# ---------------- OCR-only Classifier ----------------
-def resize_max_side(img, max_side):
-    h, w = img.shape[:2]
-    if max(h, w) <= max_side:
-        return img, 1.0
-    scale = max_side / float(max(h, w))
-    out = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
-    return out, scale
-
-def center_crop(img, frac):
-    if not (0.3 <= frac <= 1.0):
-        return img
-    h, w = img.shape[:2]
-    cx, cy = w//2, h//2
-    rx, ry = int(w*frac/2), int(h*frac/2)
-    x1, y1, x2, y2 = max(0,cx-rx), max(0,cy-ry), min(w,cx+rx), min(h,cy+ry)
-    return img[y1:y2, x1:x2]
-
-def crop_to_digit_cluster(img_bgr):
-    """
-    Use MSER to find a glyph-like region, prefer near-center, crop tightly with padding.
-    Falls back to a contour-based method if MSER returns nothing or isn't available.
-    """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    # --- Try MSER (positional args to avoid keyword incompatibility) ---
-    regions = None
-    try:
-        # delta=5, min_area=60, max_area=5000 (tweak if needed)
-        mser = cv2.MSER_create(5, 60, 5000)
-        regions, _ = mser.detectRegions(gray)
-    except Exception:
-        regions = None
-
-    h, w = gray.shape[:2]
-    cx, cy = w // 2, h // 2
-
-    def crop_from_regions(regs):
-        if not regs:
-            return None
-        best_rect, best_score = None, 1e12
-        for r in regs:
-            x, y, w2, h2 = cv2.boundingRect(r.reshape(-1, 1, 2))
-            center_dist = ((x + w2 / 2 - cx) ** 2 + (y + h2 / 2 - cy) ** 2) ** 0.5
-            aspect_penalty = abs((w2 / max(h2, 1e-3)) - 0.7)  # soft preference for digit-ish boxes
-            score = center_dist + 50 * aspect_penalty
-            if score < best_score:
-                best_score, best_rect = score, (x, y, w2, h2)
-        if best_rect is None:
-            return None
-        x, y, w2, h2 = best_rect
-        pad = int(0.25 * max(w2, h2))
-        x1, y1 = max(0, x - pad), max(0, y - pad)
-        x2, y2 = min(img_bgr.shape[1], x + w2 + pad), min(img_bgr.shape[0], y + h2 + pad)
-        return img_bgr[y1:y2, x1:x2]
-
-    # If MSER produced something, crop from it
-    if regions:
-        cropped = crop_from_regions(regions)
-        if cropped is not None:
-            return cropped
-
-    # --- Fallback: simple contour-based glyph guess near center ---
-    # Adaptive threshold to pull strokes; adjust blockSize/C if needed
-    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                cv2.THRESH_BINARY_INV, 31, 7)
-    # clean small noise
-    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
-
-    contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return img_bgr
-
-    best_rect, best_score = None, 1e12
-    for cnt in contours:
-        x, y, w2, h2 = cv2.boundingRect(cnt)
-        area = w2 * h2
-        if area < 60 or area > 8000:  # filter extremes
-            continue
-        center_dist = ((x + w2 / 2 - cx) ** 2 + (y + h2 / 2 - cy) ** 2) ** 0.5
-        aspect_penalty = abs((w2 / max(h2, 1e-3)) - 0.7)
-        score = center_dist + 50 * aspect_penalty
-        if score < best_score:
-            best_score, best_rect = score, (x, y, w2, h2)
-
-    if best_rect is None:
-        return img_bgr
-
-    x, y, w2, h2 = best_rect
-    pad = int(0.25 * max(w2, h2))
-    x1, y1 = max(0, x - pad), max(0, y - pad)
-    x2, y2 = min(img_bgr.shape[1], x + w2 + pad), min(img_bgr.shape[0], y + h2 + pad)
-    return img_bgr[y1:y2, x1:x2]
-
-def ocr_digits_single(img_bgr, psm=6, inv=False, force_no_invert=False, verbose=False):
-    """Run Tesseract OCR on a single preprocessed image."""
-    if not HAVE_TESS:
-        vprint(verbose, "OCR skipped: pytesseract/tesseract not installed.")
-        return None, ""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    if inv:
-        gray = 255 - gray
-    config = (
-        f"--oem 1 --psm {psm} "
-        "-c tessedit_char_whitelist=0123456789 "
-        "-c classify_bln_numeric_mode=1"
-    )
-    if force_no_invert:
-        config += " -c tessedit_do_invert=0"
-    txt = pytesseract.image_to_string(gray, config=config).strip()
-    if verbose: print(f"  OCR(psm={psm}, inv={inv}) -> [{txt}]", flush=True)
-    return txt, config
-
-def parse_numeric(txt, allow_zero=False, max_face=20, percentile=False):
-    """
-    Return int if 1..max_face (or 0 if allow_zero).
-    Special handling:
-      - percentile=True: map '00' to 100 (or 0 if allow_zero=True)
-    """
-    if not txt:
+# ---------- Gemini ----------
+def parse_int(text, max_face):
+    import re
+    s = (text or "").strip().lower()
+    if s == "unknown":
         return None
-    # Keep only digits
-    digits = "".join(ch for ch in txt if ch.isdigit())
-    if digits == "" and not allow_zero:
-        return None
-    # Handle percentile '00'
-    if percentile and digits in ("00", "000"):
-        return 100 if not allow_zero else 0
-    try:
-        n = int(digits) if digits != "" else 0
-    except Exception:
-        return None
-    # Range filter
-    if allow_zero and n == 0:
-        return 0
-    if 1 <= n <= max_face or (percentile and n in (10,20,30,40,50,60,70,80,90,100)):
+    m = re.search(r"\b(\d{1,3})\b", s)
+    if not m: return None
+    n = int(m.group(1))
+    if (1 <= n <= max_face) or (max_face == 100 and 1 <= n <= 100):
         return n
     return None
 
-def enhance_for_ocr(img_bgr, mode, verbose=False):
-    """
-    Create OCR-friendly views.
-    mode:
-      'bw'       -> Otsu
-      'clahe'    -> CLAHE + Otsu
-      'tophat'   -> white tophat + Otsu
-      'morph'    -> opening to remove noise
-    """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    if mode == "bw":
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
-    if mode == "clahe":
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        g2 = clahe.apply(gray)
-        _, bw = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
-    if mode == "tophat":
-        kernel = np.ones((9,9), np.uint8)
-        top = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-        _, bw = cv2.threshold(top, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
-    if mode == "morph":
-        g2 = cv2.medianBlur(gray, 3)
-        opn = cv2.morphologyEx(g2, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
-        _, bw = cv2.threshold(opn, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
-    return img_bgr
+def read_with_gemini(image_path, max_face=20, verbose=False):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Set GEMINI_API_KEY or GOOGLE_API_KEY in your shell (e.g., ~/.bashrc)")
 
-def enhance_gold_on_dark(img_bgr):
-    """
-    Specialized preprocessor for metallic gold digits on dark burgundy/purple dice.
-    Produces a text-like image with dark digits on light background.
-    """
-    # 1) HSV mask for yellow/gold
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    # Hue 10-35 (warm), S 60+, V 70+ — tune if needed
-    mask1 = cv2.inRange(hsv, (10, 60, 70), (35, 255, 255))
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # 2) Reinforce with LAB b-channel (yellow high)
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    b = lab[:,:,2]
-    _, mask2 = cv2.threshold(b, 150, 255, cv2.THRESH_BINARY)  # tune 140–170
+    # Upload file (per SDK docs) and generate
+    file_ref = client.files.upload(file=image_path)
+    if verbose:
+        print(f"[upload] name={file_ref.name} uri={getattr(file_ref, 'uri', None)}")
 
-    mask = cv2.bitwise_and(mask1, mask2)
+    contents = [
+        types.Part.from_text(text=INSTRUCTION),
+        file_ref,
+        types.Part.from_text(text=f"Die type: d{max_face}. Return only the top face integer."),
+    ]
+    resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+    text = (getattr(resp, "text", None) or getattr(resp, "output_text", "") or "").strip()
+    if verbose:
+        print(f"[model] {text}")
+    n = parse_int(text, max_face)
+    if n is None:
+        raise RuntimeError(f"Model did not return a valid integer. Raw: {text!r}")
+    return n, text
 
-    # Clean mask
-    k = np.ones((3,3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
-
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    ink = cv2.bitwise_and(gray, gray, mask=mask)
-    ink = cv2.normalize(ink, None, 0, 255, cv2.NORM_MINMAX)
-    _, bw = cv2.threshold(ink, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-
-    # Invert so digits are dark on light
-    bw = 255 - bw
-    bw = cv2.morphologyEx(bw, cv2.MORPH_DILATE, np.ones((2,2), np.uint8), iterations=1)
-    return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
-
-def rotate_bound(img, angle_deg):
-    (h, w) = img.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-    cos = abs(M[0,0]); sin = abs(M[0,1])
-    nw = int((h*sin) + (w*cos))
-    nh = int((h*cos) + (w*sin))
-    M[0,2] += (nw/2) - center[0]
-    M[1,2] += (nh/2) - center[1]
-    return cv2.warpAffine(img, M, (nw, nh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-def unsharp_mask(img_bgr, blur_ks=5, amount=1.2):
-    blur = cv2.GaussianBlur(img_bgr, (blur_ks, blur_ks), 0)
-    sharp = cv2.addWeighted(img_bgr, 1 + amount, blur, -amount, 0)
-    return np.clip(sharp, 0, 255).astype(np.uint8)
-
-def upsample(img_bgr, factor):
-    if abs(factor - 1.0) < 1e-3:
-        return img_bgr
-    h, w = img_bgr.shape[:2]
-    return cv2.resize(img_bgr, (int(w*factor), int(h*factor)), interpolation=cv2.INTER_CUBIC)
-
-def progressive_ocr(jpg_path, verbose=False,
-                    roi_step_sequence=(0.6, 0.8, 1.0),
-                    max_side_sequence=(480, 640, 960, 1280),
-                    total_budget_ms=1500,
-                    allow_zero=False,
-                    max_face=20,
-                    percentile=False,
-                    save_debug_images=True,
-                    heavy=False,
-                    rotations=(-12,-8,-4,0,4,8,12),
-                    upscales=(1.0,1.5,2.0)):
-    """
-    Two-stage OCR:
-      1) Quick pass (short budget) using goldmask + standard preprocessors
-      2) Optional heavy pass (rotations, upscales, stronger sharpening, larger scales)
-    Stops immediately on the first valid numeric result.
-    """
-    t0 = ms()
-    vprint(verbose, f"[OCR] Start classification on: {jpg_path}")
-    img_full = cv2.imread(jpg_path)
-    if img_full is None:
-        vprint(verbose, "[OCR] Could not load image.")
-        return None
-
-    dbg_dir = Path(jpg_path).with_suffix("")
-    if save_debug_images:
-        Path(str(dbg_dir) + "_dbg").mkdir(parents=True, exist_ok=True)
-
-    # ---------- Common config ----------
-    # Favor single-char/line first
-    psms_quick = [10, 13, 6, 7, 8, 11]
-    psms_heavy = [10, 13, 6, 7, 8, 11, 12, 3]  # add more just in case
-    preprocess_modes = ["goldmask", "clahe", "tophat", "morph", "bw"]
-
-    def try_ocr_on(img_bgr, stage_tag):
-        """Inner routine that runs the full preproc/psm loop on a given image crop."""
-        nonlocal t0
-        for mode in preprocess_modes:
-            if not within_budget(t0, total_budget_ms): return None
-            if mode == "goldmask":
-                proc = enhance_gold_on_dark(img_bgr); force_no_invert = True
-            else:
-                proc = enhance_for_ocr(img_bgr, mode, verbose); force_no_invert = False
-
-            # optional sharpening helps thin strokes
-            proc = unsharp_mask(proc, blur_ks=5, amount=0.8)
-
-            if save_debug_images:
-                save_debug(proc, Path(str(dbg_dir) + f"_dbg/{stage_tag}_{mode}.png"), verbose)
-
-            inv_opts = (False,) if force_no_invert else (False, True)
-            psms = psms_quick if "quick" in stage_tag else psms_heavy
-
-            for inv in inv_opts:
-                if not within_budget(t0, total_budget_ms): return None
-                for psm in psms:
-                    if not within_budget(t0, total_budget_ms): return None
-                    txt, _ = ocr_digits_single(proc, psm=psm, inv=inv,
-                                               force_no_invert=force_no_invert, verbose=verbose)
-                    n = parse_numeric(txt, allow_zero=allow_zero, max_face=max_face, percentile=percentile)
-                    if n is not None:
-                        vprint(verbose, f"[OCR] ✓ RESULT: {n} ({stage_tag}, mode={mode}, inv={inv}, psm={psm})")
-                        return n
-        return None
-
-    # ---------- Pass 1: Quick (bounded) ----------
-    stage = 0
-    for roi_frac in roi_step_sequence:
-        for max_side in max_side_sequence:
-            if not within_budget(t0, total_budget_ms): break
-            stage += 1
-            img_roi = center_crop(img_full, roi_frac)
-            img_small, _ = resize_max_side(img_roi, max_side)
-            img_digits = crop_to_digit_cluster(img_small)
-            if save_debug_images:
-                save_debug(img_digits, Path(str(dbg_dir) + f"_dbg/quick_{stage}.jpg"), verbose)
-            res = try_ocr_on(img_digits, f"quick_s{stage}")
-            if res is not None:
-                return res
-
-    if not heavy:
-        vprint(verbose, f"[OCR] No result in quick pass (elapsed {elapsed_ms(t0)} ms).")
-        return None
-
-    # ---------- Pass 2: Heavy (rotations + upscales) ----------
-    # Add 4–8 seconds of budget for the heavy pass unless the user already raised it.
-    if total_budget_ms < 6000:
-        total_budget_ms += 6000  # extend budget just for this function call
-
-    vprint(verbose, "[OCR] Heavy pass enabled…")
-    stage = 0
-    for roi_frac in (0.7, 0.85, 1.0):  # slightly larger ROIs for safety
-        for max_side in list(max_side_sequence) + [1280, 1600]:  # push bigger scales
-            if not within_budget(t0, total_budget_ms): break
-            base_roi = center_crop(img_full, roi_frac)
-            base_small, _ = resize_max_side(base_roi, max_side)
-            digits = crop_to_digit_cluster(base_small)
-
-            # rotations × upscales grid
-            for ang in rotations:
-                if not within_budget(t0, total_budget_ms): break
-                rot = rotate_bound(digits, ang)
-                for us in upscales:
-                    if not within_budget(t0, total_budget_ms): break
-                    try:
-                        usf = float(us)
-                    except: 
-                        usf = 1.0
-                    cand = upsample(rot, usf)
-                    stage += 1
-                    if save_debug_images and stage <= 20:  # don’t spam disk
-                        save_debug(cand, Path(str(dbg_dir) + f"_dbg/heavy_{stage}_ang{ang}_x{usf}.jpg"), verbose)
-                    res = try_ocr_on(cand, f"heavy_s{stage}")
-                    if res is not None:
-                        return res
-
-    vprint(verbose, f"[OCR] No classification result (total {elapsed_ms(t0)} ms).")
-    return None
-
-# ---------------- Discord upload ----------------
-def post_to_discord(webhook_url, mp4_path, jpg_path, roll_result, verbose=False):
+# ---------- Discord ----------
+def post_image_to_discord(webhook_url, image_path, roll, verbose=False):
     if not webhook_url:
         vprint(verbose, "No DISCORD_WEBHOOK_URL set; skipping Discord post.")
         return False
-
-    content = f"🎲 **Roll result:** {roll_result if roll_result is not None else 'Unknown'}"
+    content = f"🎲 **Roll result:** {roll}"
     files = []
     try:
-        files.append(("files[0]", (os.path.basename(mp4_path), open(mp4_path, "rb"), "video/mp4")))
-    except Exception as e:
-        vprint(verbose, f"Could not attach video: {e}")
-    try:
-        files.append(("files[1]", (os.path.basename(jpg_path), open(jpg_path, "rb"), "image/jpeg")))
+        files.append(("files[0]", (os.path.basename(image_path), open(image_path, "rb"), "image/jpeg")))
     except Exception as e:
         vprint(verbose, f"Could not attach image: {e}")
 
-    vprint(verbose, "Posting to Discord…")
     try:
         r = requests.post(webhook_url, data={"content": content}, files=files, timeout=30)
         vprint(verbose, f"Discord response: {r.status_code} {r.text[:200]}")
@@ -565,140 +140,50 @@ def post_to_discord(webhook_url, mp4_path, jpg_path, roll_result, verbose=False)
         vprint(verbose, f"Discord post error: {e}")
         return False
 
-# ---------------- Countdown ----------------
-def countdown(verbose=False):
-    vprint(verbose, "\nGet ready…")
-    for n in [3, 2, 1]:
-        print(f"{n}…", flush=True)
-        time.sleep(1)
-    print("Roll the dice!", flush=True)  # recording starts immediately after this returns
-
-# ---------------- Main ----------------
+# ---------- Main ----------
 def main():
-    global FPS, RES_W, RES_H, DURATION_MS
+    parser = argparse.ArgumentParser(description="Capture a single bright still, read with Gemini, and post to Discord.")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--no-discord", action="store_true", help="Skip Discord post.")
+    parser.add_argument("--max-face", type=int, default=20, help="Die size (6/8/10/12/20/100).")
 
-    parser = argparse.ArgumentParser(
-        description="Record Pi Camera, make MP4, grab sharpest tail frame, OCR-only classify numbers, post to Discord."
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
-    parser.add_argument("--no-discord", action="store_true", help="Skip Discord upload even if webhook is set.")
-    parser.add_argument("--no-classify", action="store_true", help="Skip classification step.")
-
-    # capture params (literal defaults to avoid global scoping issues)
-    parser.add_argument("--fps", type=int, default=30, help="Frames per second (default 30).")
-    parser.add_argument("--width", type=int, default=1920, help="Video width (default 1920).")
-    parser.add_argument("--height", type=int, default=1080, help="Video height (default 1080).")
-    parser.add_argument("--duration-ms", type=int, default=7000, help="Duration in ms (default 7000).")
-
-    # NEW: exposure/denoise tweaks for crisp digits
-    parser.add_argument("--shutter-us", type=int, default=10000, help="Shutter in microseconds (e.g., 10000 ≈ 1/100s).")
-    parser.add_argument("--gain", type=float, default=1.0, help="Analog gain (ISO-ish).")
-    parser.add_argument("--awb", type=str, default="incandescent", help="AWB mode (auto, incandescent, daylight, etc.)")
-    parser.add_argument("--denoise", type=str, default="off", help="Denoise (off, cdn_off, cdn_fast, cdn_hq)")
-
-    # OCR tuning
-    parser.add_argument("--ocr-budget", type=int, default=5000, help="Total OCR time budget (ms).")
-    parser.add_argument("--max-face", type=int, default=20, help="Max face value (e.g., 20 for d20, 12 for d12, 100 for percentile).")
-    parser.add_argument("--allow-zero", action="store_true", help="Allow 0 as valid result (e.g., some rules for percentile).")
-    parser.add_argument("--percentile", action="store_true", help="Treat '00' as 100 (or 0 if --allow-zero).")
-    parser.add_argument("--roi-seq", type=str, default="0.6,0.8,1.0", help="ROI center crop fractions in order (comma).")
-    parser.add_argument("--maxside-seq", type=str, default="480,640,960,1280", help="Max-side sizes in order (comma).")
-
-    # NEW: best-tail-frame extraction knobs
-    parser.add_argument("--tail-window-s", type=float, default=0.6, help="Seconds from end to sample frames.")
-    parser.add_argument("--tail-frames", type=int, default=10, help="Number of frames to sample from tail window.")
-
-    parser.add_argument("--heavy-ocr", action="store_true", help="Enable heavy fallback pass if quick pass fails.")
-    parser.add_argument("--rotations", type=str, default="-12,-8,-4,0,4,8,12", help="Angles (deg) to try in heavy pass.")
-    parser.add_argument("--upscale", type=str, default="1.0,1.5,2.0", help="Upscale factors to try in heavy pass.")
+    # Camera options (defaults chosen to restore auto-exposure behavior)
+    parser.add_argument("--width", type=int, default=1920)
+    parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument("--quality", type=int, default=90, help="JPEG quality 1..100")
+    parser.add_argument("--countdown", action="store_true", help="Show 3..2..1 before capture.")
 
     args = parser.parse_args()
     verbose = args.verbose
 
-    # apply CLI capture overrides
-    FPS, RES_W, RES_H, DURATION_MS = args.fps, args.width, args.height, args.duration_ms
-
-    # deps
-    if shutil.which("rpicam-vid") is None:
-        print("Error: rpicam-vid not found. Install rpicam-apps.", file=sys.stderr); sys.exit(1)
-    if shutil.which("ffmpeg") is None:
-        print("Error: ffmpeg not found. Install ffmpeg.", file=sys.stderr); sys.exit(1)
-    if not HAVE_TESS and not args.no_classify:
-        print("Warning: pytesseract/tesseract-ocr not found; OCR will be skipped.", file=sys.stderr)
-
-    # Ctrl+C graceful
+    # ctrl+c graceful
     signal.signal(signal.SIGINT, lambda *a: sys.exit(130))
-
-    # parse sequences
-    try:
-        roi_seq = [float(x.strip()) for x in args.roi_seq.split(",") if x.strip()]
-        maxside_seq = [int(x.strip()) for x in args.maxside_seq.split(",") if x.strip()]
-    except Exception:
-        print("Bad --roi-seq or --maxside-seq format.", file=sys.stderr); sys.exit(2)
 
     ts = nowtag()
 
-    # countdown → record immediately
-    countdown(verbose=verbose)
+    if args.countdown:
+        countdown(verbose=verbose)
 
     try:
-        mp4_path = record_video(
-            ts,
-            verbose=verbose,
-            prefer_libav=True,
-            fps=FPS,
-            w=RES_W,
-            h=RES_H,
-            duration_ms=DURATION_MS,
-            shutter_us=args.shutter_us,
-            gain=args.gain,
-            awb=args.awb,
-            denoise=args.denoise
-        )
+        jpg_path = capture_still(ts, w=args.width, h=args.height, quality=args.quality, verbose=verbose)
     except Exception as e:
         print(f"Capture error: {e}", file=sys.stderr, flush=True); sys.exit(3)
 
-    try:
-        # NEW: select sharpest tail frame
-        jpg_path = extract_best_tail_frame(
-            mp4_path, ts, verbose=verbose, tail_window_s=args.tail_window_s, n_frames=args.tail_frames
-        )
-        # If you prefer the old single-frame behavior, comment the block above and uncomment below:
-        # jpg_path = extract_last_frame(mp4_path, ts, verbose=verbose)
-    except Exception as e:
-        print(f"Tail-frame extract error: {e}", file=sys.stderr, flush=True); sys.exit(4)
-
-    # explicitly confirm we’re classifying the exact _last.jpg we saved
     print(f"Classifying exactly: {jpg_path}", flush=True)
 
-    roll = None
-    if not args.no_classify:
-        roll = progressive_ocr(
-            jpg_path,
-            verbose=verbose,
-            roi_step_sequence=roi_seq,
-            max_side_sequence=maxside_seq,
-            total_budget_ms=args.ocr_budget,
-            allow_zero=args.allow_zero,
-            max_face=args.max_face,
-            percentile=args.percentile,
-            save_debug_images=True,
-            heavy=args.heavy_ocr,
-            rotations=[int(a) for a in args.rotations.split(",") if a.strip()],
-            upscales=[float(u) for u in args.upscale.split(",") if u.strip()]
-        )
-
+    try:
+        roll, raw = read_with_gemini(jpg_path, max_face=args.max_face, verbose=verbose)
         print(f"Detected roll: {roll}", flush=True)
+    except Exception as e:
+        print(f"Gemini error: {e}", file=sys.stderr, flush=True)
+        roll = "unknown"
 
-    posted = False
-    if not args.no_discord and DISCORD_WEBHOOK_URL:
-        posted = post_to_discord(DISCORD_WEBHOOK_URL, mp4_path, jpg_path, roll, verbose=verbose)
-        print("Posted to Discord." if posted else "Failed to post to Discord.", flush=True)
-    else:
-        vprint(verbose, "Discord step skipped (no webhook or --no-discord).")
+    if not args.no_discord:
+        ok = post_image_to_discord(DISCORD_WEBHOOK_URL, jpg_path, roll, verbose=verbose)
+        print("Posted to Discord." if ok else "Failed to post to Discord.", flush=True)
 
-    print("Video:", mp4_path, flush=True)
-    print("Last frame:", jpg_path, flush=True)
+    print("Image:", jpg_path, flush=True)
 
 if __name__ == "__main__":
+    import shutil as _shutil
     main()
