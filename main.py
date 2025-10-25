@@ -19,15 +19,21 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 INSTRUCTION = (
-    "You are a precise die-reading assistant.\n"
-    "Task: identify the TOP face of a single polyhedral die and return ONLY the integer printed on that top face.\n"
+    "You are a die-reading assistant.\n"
+    "Look at the image and identify the value on the TOP face of every visible die.\n"
     "\n"
-    "Critical rules:\n"
-    "1) The correct result is the face that is UP (most horizontal), not the face pointing toward the camera.\n"
-    "2) If multiple faces are visible, choose the one whose surface is most parallel to the ground: it appears least foreshortened and most symmetric.\n"
-    "3) Ignore faces that look front-facing toward the camera if they are not the horizontal top face.\n"
-    "4) The top digit can be rotated in any direction; rotation does not matter.\n"
-    "5) Return ONLY the Arabic numeral of the TOP face as plain digits. If uncertain, return exactly: unknown\n"
+    "Rules:\n"
+    "1) For most dice, the correct face is the one facing UP (most horizontal), not the one pointing toward the camera.\n"
+    "2) The top face looks least angled and most parallel to the ground.\n"
+    "3) Ignore faces that look front-facing or vertical.\n"
+    "4) Digits may be rotated; orientation doesn’t matter.\n"
+    "5) For d4 dice (pyramid shape), report the number printed at the TOP TIP, not on the base.\n"
+    "6) If multiple dice are present, read each die separately and sum them.\n"
+    "7) Output as an equation: '5+4+6=15'.\n"
+    "8) If any die is unreadable, use 'unknown' and show partial sum, e.g. '3+unknown+5=8+'.\n"
+    "9) If nothing is readable, return exactly: unknown.\n"
+    "\n"
+    "Return only the result—no extra words or punctuation."
 )
 # ============================================
 
