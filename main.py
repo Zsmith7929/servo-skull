@@ -131,7 +131,7 @@ def post_image_to_discord(webhook_url, image_path, roll, verbose=False):
     if not webhook_url:
         vprint(verbose, "No DISCORD_WEBHOOK_URL set; skipping Discord post.")
         return False
-    content = f"🎲 **Roll result:** {roll}"
+    content = f" **Gemini thinks this roll is:** {roll}"
     files = []
     try:
         files.append(("files[0]", (os.path.basename(image_path), open(image_path, "rb"), "image/jpeg")))
