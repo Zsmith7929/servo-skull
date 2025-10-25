@@ -597,7 +597,7 @@ def main():
     parser.add_argument("--denoise", type=str, default="off", help="Denoise (off, cdn_off, cdn_fast, cdn_hq)")
 
     # OCR tuning
-    parser.add_argument("--ocr-budget", type=int, default=1500, help="Total OCR time budget (ms).")
+    parser.add_argument("--ocr-budget", type=int, default=5000, help="Total OCR time budget (ms).")
     parser.add_argument("--max-face", type=int, default=20, help="Max face value (e.g., 20 for d20, 12 for d12, 100 for percentile).")
     parser.add_argument("--allow-zero", action="store_true", help="Allow 0 as valid result (e.g., some rules for percentile).")
     parser.add_argument("--percentile", action="store_true", help="Treat '00' as 100 (or 0 if --allow-zero).")
@@ -608,7 +608,6 @@ def main():
     parser.add_argument("--tail-window-s", type=float, default=0.6, help="Seconds from end to sample frames.")
     parser.add_argument("--tail-frames", type=int, default=10, help="Number of frames to sample from tail window.")
 
-    parser.add_argument("--ocr-budget", type=int, default=1500, help="Total OCR time budget (ms).")
     parser.add_argument("--heavy-ocr", action="store_true", help="Enable heavy fallback pass if quick pass fails.")
     parser.add_argument("--rotations", type=str, default="-12,-8,-4,0,4,8,12", help="Angles (deg) to try in heavy pass.")
     parser.add_argument("--upscale", type=str, default="1.0,1.5,2.0", help="Upscale factors to try in heavy pass.")
